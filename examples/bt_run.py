@@ -48,6 +48,7 @@ def my_strage():
     cerebro.run() 
     # 引擎运行后打期末资金  
     print('组合期末资金: %.2f' % cerebro.broker.getvalue())
+    
 
 if __name__ == "__main__":
     my_strage()
