@@ -31,7 +31,7 @@ def my_strage():
     modpath = os.path.dirname(os.path.abspath(sys.argv[0]))
 
     # 用pandas读取CSV数据
-    df = pd.read_csv(os.path.join(modpath, '../TSLA_data.csv'), parse_dates=['datetime'])
+    df = pd.read_csv(os.path.join(modpath, './TSLA_data.csv'), parse_dates=['datetime'])
     df.set_index('datetime', inplace=True)
     data = bt.feeds.PandasData(
         dataname=df,
