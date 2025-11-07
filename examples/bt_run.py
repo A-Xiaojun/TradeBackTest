@@ -13,6 +13,11 @@ class cBackTest(bt.Strategy):
 
     def __init__(self):
         self.dataclose = self.datas[0].close
+        self.order = None
+        self.buyprice = None
+        self.buycomm = None
+        self.sellprice = None
+        self.sellcomm = None
 
     def notify_order(self, order):
         if order.status in [order.Submitted, order.Accepted]:
@@ -24,14 +29,23 @@ class cBackTest(bt.Strategy):
         if order.status in [order.Completed]:
             if order.isbuy():
                 self.log(f"已买入, 价格: {order.executed.price:.2f}, 成本: {order.executed.value:.2f}, 手续费: {order.executed.comm:.2f}")
+                self.buyprice = order.executed.price
+                self.buycomm = order.executed.comm
             elif order.issell():
                 self.log(f"已卖出, 价格: {order.executed.price:.2f}, 成本: {order.executed.value:.2f}, 手续费: {order.executed.comm:.2f}")
+                self.sellprice = order.executed.price
+                self.sellcomm = order.executed.comm
             #记录交易数量
             self.bar_executed = len(self)
         elif order.status in [order.Canceled, order.Margin, order.Rejected]:
             self.log('订单取消/保证金不足/拒绝')
         # 其他状态记录为：无挂起订单 
         self.order = None
+
+    def notify_trade(self, trade):
+        if not trade.isclosed:
+            return
+        self.log(f"已平仓, 交易利润, 毛利润 {trade.pnl:.2f}, 净利润 {trade.pnlcomm:.2f}")
 
     def next(self):
         self.log(f"Close: {self.dataclose[0]}")
@@ -69,7 +83,7 @@ def my_strage():
 
     # 设置投资金额100000.0 
     cerebro.broker.setcash(100000.0) 
-
+    cerebro.broker.setcommission(commission=0.001)
     # 引擎运行前打印期出资金  
     print('组合期初资金: %.2f' % cerebro.broker.getvalue()) 
     cerebro.run() 
