@@ -4,7 +4,7 @@ import pandas as pd
 import os
 import datetime
 import sys # 获取当前运行脚本的路径 (in argv[0]) 
-# import matplotlib
+import matplotlib
 
 class cBackTest(bt.Strategy):
     def log(self,txt,dt = None):
@@ -89,7 +89,7 @@ def my_strage():
     cerebro.run() 
     # 引擎运行后打期末资金  
     print('组合期末资金: %.2f' % cerebro.broker.getvalue())
-
+    cerebro.plot()
 
 if __name__ == "__main__":
     my_strage()
