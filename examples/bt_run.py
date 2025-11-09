@@ -72,12 +72,12 @@ def my_strage():
     modpath = os.path.dirname(os.path.abspath(sys.argv[0]))
 
     # 用pandas读取CSV数据
-    df = pd.read_csv(os.path.join(modpath, './TSLA_data.csv'), parse_dates=['datetime'])
+    df = pd.read_csv(os.path.join(modpath, './btc_kline.csv'), parse_dates=['datetime'])
     df.set_index('datetime', inplace=True)
     data = bt.feeds.PandasData(
         dataname=df,
-        fromdate=datetime.datetime(2023, 1, 3),
-        todate=datetime.datetime(2023, 12, 29)
+        fromdate=datetime.datetime(2025, 1, 14),
+        todate=datetime.datetime(2025, 11, 9)
     )
     cerebro.adddata(data)
 
