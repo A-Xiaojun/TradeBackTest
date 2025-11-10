@@ -18,10 +18,13 @@ class cBackTest(bt.Strategy):
         self.buycomm = None
         self.sellprice = None
         self.sellcomm = None
+        self.ema12 = bt.indicators.ExponentialMovingAverage(self.datas[0], period=12)
+        self.ema144 = bt.indicators.ExponentialMovingAverage(self.datas[0], period=144)
+        self.ema169 = bt.indicators.ExponentialMovingAverage(self.datas[0], period=169)
 
     def notify_order(self, order):
         if order.status in [order.Submitted, order.Accepted]:
-                # broker 提交/接受了，买/卖订单则什么都不做 
+                # broker 提交/接受了，买/卖订单则什么都不做  
                 return
 
         # 检查一个订单是否完成  
@@ -52,13 +55,11 @@ class cBackTest(bt.Strategy):
        
         if not self.position:
              # 今天的收盘价 < 昨天收盘价
-            if(self.dataclose[0] < self.dataclose[-1]):
-                # 今天的收盘价 < 前天收盘价
-                if(self.dataclose[-1] < self.dataclose[-2]):
+                if self.dataclose[0] >= self.ema169[0] and self.dataclose[0] <= self.ema144[0]:
                     self.log('买入, %.2f' % self.dataclose[0])
                     self.order = self.buy()
         else:
-            if len(self) >= self.bar_executed + 5:
+            if self.dataclose[0] < self.ema169[0]:
                 self.log('卖出, %.2f' % self.dataclose[0])
                 self.order = self.sell()
 
@@ -76,8 +77,8 @@ def my_strage():
     df.set_index('datetime', inplace=True)
     data = bt.feeds.PandasData(
         dataname=df,
-        fromdate=datetime.datetime(2025, 1, 14),
-        todate=datetime.datetime(2025, 11, 9)
+        fromdate=datetime.datetime(2025, 11,10, 10, 0, 0),
+        todate=datetime.datetime(2025, 11, 10, 14, 59, 0)
     )
     cerebro.adddata(data)
 
