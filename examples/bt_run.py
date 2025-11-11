@@ -73,15 +73,15 @@ def my_strage():
     modpath = os.path.dirname(os.path.abspath(sys.argv[0]))
 
     # 用pandas读取CSV数据
-    df = pd.read_csv(os.path.join(modpath, './btc_kline.csv'), parse_dates=['datetime'])
+    df = pd.read_csv(os.path.join(modpath, '../BTC-USD_1H_20251111_222737.csv'), parse_dates=['datetime'])
+    print("数据长度：", len(df))  # df 是你的 DataFrame
     df.set_index('datetime', inplace=True)
     data = bt.feeds.PandasData(
         dataname=df,
-        fromdate=datetime.datetime(2025, 11,10, 10, 0, 0),
-        todate=datetime.datetime(2025, 11, 10, 14, 59, 0)
+        fromdate=datetime.datetime(2025, 11,6, 14, 30, 0),
+        todate=datetime.datetime(2025, 11, 9, 23,55, 0)
     )
     cerebro.adddata(data)
-
     # 设置投资金额100000.0 
     cerebro.broker.setcash(100000.0) 
     cerebro.broker.setcommission(commission=0.001)
