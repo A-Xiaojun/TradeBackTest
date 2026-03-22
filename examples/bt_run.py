@@ -116,6 +116,8 @@ def my_strage():
     print('组合期末资金: %.2f' % cerebro.broker.getvalue())
     cerebro.plot()
 
+    cerebro.plot() 
+
 if __name__ == "__main__":
     my_strage()
 
