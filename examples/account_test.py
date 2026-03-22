@@ -12,19 +12,23 @@ import unittest
 import ccxt
 import pandas as pd
 import time
+import os
+import json
+
+_base_dir = os.path.dirname(__file__)
+_local_cfg = os.path.join(_base_dir, 'config.local')
+_cfg_path = _local_cfg if os.path.exists(_local_cfg) else os.path.join(_base_dir, 'config')
+with open(_cfg_path, 'r', encoding='utf-8') as _f:
+    _cfg = json.load(_f)
 
 okx = ccxt.okx({
-    'apiKey': 'yours apiKey',
-    'secret': 'yours secret',
-    'password': 'yours password',
+    'apiKey': _cfg['apiKey'],
+    'secret': _cfg['secret'],
+    'password': _cfg['password'],
     'options': {
         'defaultType': 'option',
     },
-    'enableRateLimit':True,
-    # 'proxies': {
-    #     'http': 'http://127.0.0.1:7890',
-    #     'https': 'http://127.0.0.1:7890',
-    # }
+    'enableRateLimit': True,
     })
 def test_account_bills():
     print('账户账单信息:', okx.fetch_balance())
