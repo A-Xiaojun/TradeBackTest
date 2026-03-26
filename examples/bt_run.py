@@ -20,6 +20,15 @@ class RightSidePivotStrategy(bt.Strategy):
         ('pivot_period', 5),  # 寻找局部高低点的窗口期（左右各看几根K线）
         ('risk_percent', 0.10), # 每次开仓使用资金比例 (10%)
         ('leverage', 10.0),   # 新增：杠杆倍数，默认 10x
+        ('atr_period', 14),
+        ('adx_period', 14),
+        ('adx_threshold', 18.0),
+        ('bb_period', 20),
+        ('bb_dev', 2.0),
+        ('bb_bandwidth_threshold', 0.010),
+        ('min_swing_atr_mult', 0.6),
+        ('breakout_buffer_atr_mult', 0.10),
+        ('cooldown_bars', 2),
     )
 
     def __init__(self):
@@ -33,16 +42,23 @@ class RightSidePivotStrategy(bt.Strategy):
         self.equity_curve = []
         self.position_curve = []
         self.position_value_curve = [] # 新增：记录仓位的名义USDT价值
+        self.trade_pnls = []
         self.dt_records = []
 
         # 记录波峰(Highs)和波谷(Lows)
         self.highs = []
         self.lows = []
+        self.last_exit_bar = -10
+        self.bar_count = 0
         
         # 记录给绘图用（占位，保持兼容原有绘图代码逻辑）
         # 如果需要可以在图中绘制，这里复用 ema_fast / ema_slow 的变量名来占位以防报错
         self.ema_fast = bt.indicators.SMA(self.datas[0], period=10) 
         self.ema_slow = bt.indicators.SMA(self.datas[0], period=20)
+        # 震荡/波动过滤指标（不用于趋势方向，只用于去噪）
+        self.atr = bt.indicators.ATR(self.datas[0], period=self.p.atr_period)
+        self.adx = bt.indicators.AverageDirectionalMovementIndex(self.datas[0], period=self.p.adx_period)
+        self.bb = bt.indicators.BollingerBands(self.datas[0], period=self.p.bb_period, devfactor=self.p.bb_dev)
 
     def next(self):
         # 记录每根K线结束后的资金和仓位情况
@@ -59,6 +75,7 @@ class RightSidePivotStrategy(bt.Strategy):
         self.position_value_curve.append(margin_used)
         
         self.dt_records.append(self.datas[0].datetime.datetime(0))
+        self.bar_count += 1
         
         if self.order:
             return  # 有挂单则不处理
@@ -98,15 +115,25 @@ class RightSidePivotStrategy(bt.Strategy):
 
         close = self.datas[0].close[0]
 
+        # 震荡过滤：布林带带宽过窄且 ADX 偏低，跳过
+        bb_width = 0.0
+        if hasattr(self.bb, 'top') and hasattr(self.bb, 'bot') and close != 0:
+            bb_width = (self.bb.top[0] - self.bb.bot[0]) / abs(close)
+        if not self.position and (self.bar_count - self.last_exit_bar) <= self.p.cooldown_bars:
+            return
+        if (bb_width < self.p.bb_bandwidth_threshold) and (self.adx[0] < self.p.adx_threshold):
+            return
+
         # ---------------- 交易逻辑 ----------------
         if not self.position:
             # 1. 寻找做多机会：越来越高的低点 (Higher Lows) 且向上突破
             if len(self.lows) >= 2:
                 # 判断最近两个低点是否抬高
-                if self.lows[-1] > self.lows[-2]:
+                swing_ok = (self.lows[-1] - self.lows[-2]) >= self.p.min_swing_atr_mult * max(self.atr[0], 1e-9)
+                if self.lows[-1] > self.lows[-2] and swing_ok:
                     # 确认右侧拐头：当前价格突破了最近的一根阻力K线（简单起见用最近两根K线的高点突破）
                     recent_high = max(self.datas[0].high[-1], self.datas[0].high[-2])
-                    if close > recent_high:
+                    if close > (recent_high + self.p.breakout_buffer_atr_mult * self.atr[0]):
                         # 资金管理：计算10%资金能买多少股，并加上杠杆
                         target_value = self.broker.getvalue() * self.p.risk_percent * self.p.leverage
                         size = target_value / close
@@ -118,10 +145,11 @@ class RightSidePivotStrategy(bt.Strategy):
             # 2. 寻找做空机会：越来越低的高点 (Lower Highs) 且向下跌破
             if len(self.highs) >= 2 and not self.order:
                 # 判断最近两个高点是否降低
-                if self.highs[-1] < self.highs[-2]:
+                swing_ok = (self.highs[-2] - self.highs[-1]) >= self.p.min_swing_atr_mult * max(self.atr[0], 1e-9)
+                if self.highs[-1] < self.highs[-2] and swing_ok:
                     # 确认右侧拐头：当前价格跌破最近支撑
                     recent_low = min(self.datas[0].low[-1], self.datas[0].low[-2])
-                    if close < recent_low:
+                    if close < (recent_low - self.p.breakout_buffer_atr_mult * self.atr[0]):
                         target_value = self.broker.getvalue() * self.p.risk_percent * self.p.leverage
                         size = target_value / close
                         
@@ -173,6 +201,10 @@ class RightSidePivotStrategy(bt.Strategy):
     def notify_trade(self, trade):
         if trade.isclosed:
             self.log(f'交易结束, 毛利润: {trade.pnl:.2f}, 净利润: {trade.pnlcomm:.2f}')
+            self.stop_price = None
+            dt = self.datas[0].datetime.datetime(0)
+            self.trade_pnls.append((dt, float(trade.pnlcomm)))
+            self.last_exit_bar = self.bar_count
 
 
 def plot_results(df_plot, strat, initial_cash):
@@ -187,12 +219,10 @@ def plot_results(df_plot, strat, initial_cash):
     x_num = mdates.date2num(x_dt.to_pydatetime())
     
     # 1. 价格与 EMA
+    ax1.fill_between(x_dt, df_plot['ema_fast'].values, df_plot['ema_slow'].values, color='gray', alpha=0.2, label='Vegas Tunnel')
     ax1.plot(x_dt, df_plot['close'].values, '-', label='Close Price', color='#1f77b4', linewidth=1.2)
     ax1.plot(x_dt, df_plot['ema_fast'].values, '--', label='EMA(144)', color='#ff7f0e', linewidth=1.5)
     ax1.plot(x_dt, df_plot['ema_slow'].values, '--', label='EMA(169)', color='#2ca02c', linewidth=1.5)
-    
-    # 填充 Vegas 通道
-    ax1.fill_between(x_dt, df_plot['ema_fast'].values, df_plot['ema_slow'].values, color='gray', alpha=0.2, label='Vegas Tunnel')
     
     # 绘制买卖点
     buys_dt = [m[0] for m in strat.trade_markers['buy']]
@@ -205,9 +235,9 @@ def plot_results(df_plot, strat, initial_cash):
     if sells_dt:
         ax1.scatter(sells_dt, sells_p, marker='v', color='green', s=120, label='Sell', zorder=5)
         
-    ax1.set_title('BTC-USD Trading Strategy: Vegas Tunnel', fontsize=14, fontweight='bold')
+    ax1.set_title('BTC-USD Trading Strategy', fontsize=14, fontweight='bold')
     ax1.set_ylabel('Price (USD)', fontsize=12)
-    ax1.legend(loc='upper left')
+    ax1.legend(loc='upper left', fontsize=8, frameon=True, framealpha=0.8, borderpad=0.3, labelspacing=0.3, handlelength=1.5)
     ax1.grid(True, alpha=0.3)
     # 调整Y轴范围避免从0开始
     y_stack = np.vstack([df_plot['close'].values, df_plot['ema_fast'].values, df_plot['ema_slow'].values])
@@ -226,7 +256,7 @@ def plot_results(df_plot, strat, initial_cash):
                      where=(np.array(strat.equity_curve) < initial_cash), color='green', alpha=0.2, interpolate=True)
     
     ax2.set_ylabel('Equity', fontsize=12)
-    ax2.legend(loc='upper left')
+    ax2.legend(loc='upper left', fontsize=8, frameon=True, framealpha=0.8, borderpad=0.3, labelspacing=0.3, handlelength=1.5)
     ax2.grid(True, alpha=0.3)
     
     # 3. 仓位价值曲线 (Position Value in USDT)
@@ -234,22 +264,32 @@ def plot_results(df_plot, strat, initial_cash):
     ax3.fill_between(strat.dt_records, strat.position_value_curve, 0, alpha=0.3, color='#17becf')
     ax3.axhline(y=0, color='black', linewidth=1.0, alpha=0.5)
     ax3.set_ylabel('Margin (USDT)', fontsize=12)
-    ax3.legend(loc='upper left')
+    ax3.legend(loc='upper left', fontsize=8, frameon=True, framealpha=0.8, borderpad=0.3, labelspacing=0.3, handlelength=1.5)
     ax3.grid(True, alpha=0.3)
     
-    # 4. 每日收益率柱状图 (Daily Returns)
-    daily_returns = strat.analyzers.timereturn.get_analysis()
-    dr_dates = [pd.to_datetime(d) for d in daily_returns.keys()]
-    dr_values = [v * 100 for v in daily_returns.values()] # 转换为百分比
-    
-    colors = ['green' if val > 0 else 'red' for val in dr_values]
-    # bar的宽度设为0.8（天）
-    ax4.bar(dr_dates, dr_values, color=colors, width=0.8, alpha=0.7, label='Daily Return (%)')
+    # 4. 每笔平仓后的总资金变化柱状图 (Trade PnL)
+    tp_dates = [pd.Timestamp(d) for d, _ in strat.trade_pnls] if hasattr(strat, 'trade_pnls') else []
+    tp_values = [float(p) for _, p in strat.trade_pnls] if hasattr(strat, 'trade_pnls') else []
+    colors = ['green' if val >= 0 else 'red' for val in tp_values]
+    bars = ax4.bar(tp_dates, tp_values, color=colors, width=0.20, alpha=0.8, label='Trade PnL (USDT)')
+    def _fmt_pnl(v):
+        s = v
+        sign = '+' if s >= 0 else ''
+        if abs(s) >= 1e6:
+            return f'{sign}{s/1e6:.1f}M'
+        if abs(s) >= 1e3:
+            return f'{sign}{s/1e3:.1f}k'
+        return f'{sign}{s:.0f}'
+    for x, y, b in zip(tp_dates, tp_values, bars):
+        ax4.annotate(_fmt_pnl(y), xy=(x, y), xytext=(0, 6 if y >= 0 else -12), textcoords='offset points',
+                     ha='center', va='bottom' if y >= 0 else 'top', fontsize=8,
+                     color=('green' if y >= 0 else 'red'),
+                     bbox=dict(boxstyle='round,pad=0.2', fc='white', alpha=0.8, edgecolor=('green' if y >= 0 else 'red')))
     ax4.axhline(y=0, color='black', linewidth=1.0, alpha=0.5)
     
-    ax4.set_ylabel('Daily Return (%)', fontsize=12)
+    ax4.set_ylabel('Trade PnL (USDT)', fontsize=12)
     ax4.set_xlabel('Time', fontsize=12)
-    ax4.legend(loc='upper left')
+    ax4.legend(loc='upper left', fontsize=8, frameon=True, framealpha=0.8, borderpad=0.3, labelspacing=0.3, handlelength=1.5)
     ax4.grid(True, alpha=0.3)
     
     # 时间轴格式化
@@ -267,8 +307,12 @@ def plot_results(df_plot, strat, initial_cash):
     ann2 = ax2.annotate('', **ann_kw)
     ann3 = ax3.annotate('', **ann_kw)
     ann4 = ax4.annotate('', **ann_kw)
+    p_ann1 = ax1.annotate('', **ann_kw)
+    p_ann2 = ax2.annotate('', **ann_kw)
+    p_ann3 = ax3.annotate('', **ann_kw)
+    p_ann4 = ax4.annotate('', **ann_kw)
     
-    for ann in [ann1, ann2, ann3, ann4]:
+    for ann in [ann1, ann2, ann3, ann4, p_ann1, p_ann2, p_ann3, p_ann4]:
         ann.set_visible(False)
     
     vline1 = ax1.axvline(x=x_dt[0], color='black', alpha=0.4, linestyle='--')
@@ -283,6 +327,15 @@ def plot_results(df_plot, strat, initial_cash):
     
     vlines = [vline1, vline2, vline3, vline4]
     hlines = [hline1, hline2, hline3, hline4]
+    
+    p_dot1, = ax1.plot([], [], 'o', color='#1f77b4', markersize=6, alpha=0.9, zorder=6)
+    p_dot2, = ax2.plot([], [], 'o', color='purple', markersize=6, alpha=0.9, zorder=6)
+    p_dot3, = ax3.plot([], [], 'o', color='#17becf', markersize=6, alpha=0.9, zorder=6)
+    p_dot4, = ax4.plot([], [], 'o', color='gray', markersize=6, alpha=0.9, zorder=6)
+    p_dot1.set_visible(False)
+    p_dot2.set_visible(False)
+    p_dot3.set_visible(False)
+    p_dot4.set_visible(False)
     
     for line in vlines + hlines:
         line.set_visible(False)
@@ -303,22 +356,21 @@ def plot_results(df_plot, strat, initial_cash):
         xi = x_num[idx]
         
         y_close = float(df_plot['close'].iat[idx])
-        y_ema_f = float(df_plot['ema_fast'].iat[idx])
-        y_ema_s = float(df_plot['ema_slow'].iat[idx])
+        # 不使用EMA进行显示
         
         # 匹配对应时间点的资金和仓位价值 (如果有)
         eq_idx = min(idx, len(strat.equity_curve) - 1)
         y_eq = float(strat.equity_curve[eq_idx]) if eq_idx >= 0 else initial_cash
         y_pos = float(strat.position_value_curve[eq_idx]) if eq_idx >= 0 else 0.0
         
-        # 匹配对应时间点的日收益率
-        dr_dates_num = mdates.date2num(dr_dates) if dr_dates else []
-        if len(dr_dates_num) > 0:
-            dr_idx = int(np.searchsorted(dr_dates_num, mx))
-            dr_idx = max(0, min(dr_idx, len(dr_dates_num) - 1))
-            y_dr = dr_values[dr_idx]
+        # 匹配对应时间点的交易收益
+        tp_dates_num = mdates.date2num(tp_dates) if 'tp_dates' in locals() and tp_dates else []
+        if len(tp_dates_num) > 0:
+            tp_idx = int(np.searchsorted(tp_dates_num, mx))
+            tp_idx = max(0, min(tp_idx, len(tp_dates_num) - 1))
+            y_tp = tp_values[tp_idx]
         else:
-            y_dr = 0.0
+            y_tp = 0.0
             
         # 隐藏所有横线和注释
         for h in hlines: h.set_visible(False)
@@ -326,7 +378,7 @@ def plot_results(df_plot, strat, initial_cash):
             
         if event.inaxes == ax1:
             ann1.xy = (xi, y_close)
-            ann1.set_text(f"{x_dt[idx].strftime('%Y-%m-%d %H:%M')}\nClose: {y_close:.2f}\nEMA144: {y_ema_f:.2f}\nEMA169: {y_ema_s:.2f}")
+            ann1.set_text(f"{x_dt[idx].strftime('%Y-%m-%d %H:%M')}\nClose: {y_close:.2f}")
             ann1.set_visible(True)
             hline1.set_ydata([y_close, y_close])
             hline1.set_visible(True)
@@ -343,10 +395,10 @@ def plot_results(df_plot, strat, initial_cash):
             hline3.set_ydata([y_pos, y_pos])
             hline3.set_visible(True)
         elif event.inaxes == ax4:
-            ann4.xy = (xi, y_dr)
-            ann4.set_text(f"{x_dt[idx].strftime('%Y-%m-%d')}\nReturn: {y_dr:.2f}%")
+            ann4.xy = (xi, y_tp)
+            ann4.set_text(f"{x_dt[idx].strftime('%Y-%m-%d %H:%M')}\nTrade PnL: {y_tp:,.2f} USDT")
             ann4.set_visible(True)
-            hline4.set_ydata([y_dr, y_dr])
+            hline4.set_ydata([y_tp, y_tp])
             hline4.set_visible(True)
             
         for v in vlines:
@@ -356,7 +408,59 @@ def plot_results(df_plot, strat, initial_cash):
         fig.canvas.draw_idle()
 
     fig.canvas.mpl_connect('motion_notify_event', on_move)
+    def on_click(event):
+        if not event.inaxes:
+            return
+        mx = event.xdata
+        if mx is None:
+            return
+        idx = int(np.searchsorted(x_num, mx))
+        idx = max(0, min(idx, len(x_num) - 1))
+        xi = x_num[idx]
+        if event.inaxes == ax1:
+            y_close = float(df_plot['close'].iat[idx])
+            p_ann1.xy = (xi, y_close)
+            p_ann1.set_text(f"{x_dt[idx].strftime('%Y-%m-%d %H:%M')}\nClose: {y_close:.2f}")
+            p_ann1.set_visible(True)
+            p_dot1.set_data([x_dt[idx]], [y_close])
+            p_dot1.set_visible(True)
+        elif event.inaxes == ax2:
+            eq_idx = min(idx, len(strat.equity_curve) - 1)
+            y_eq = float(strat.equity_curve[eq_idx]) if eq_idx >= 0 else initial_cash
+            p_ann2.xy = (xi, y_eq)
+            p_ann2.set_text(f"{x_dt[idx].strftime('%Y-%m-%d %H:%M')}\nEquity: {y_eq:.2f}")
+            p_ann2.set_visible(True)
+            p_dot2.set_data([x_dt[idx]], [y_eq])
+            p_dot2.set_visible(True)
+        elif event.inaxes == ax3:
+            eq_idx = min(idx, len(strat.position_value_curve) - 1)
+            y_pos = float(strat.position_value_curve[eq_idx]) if eq_idx >= 0 else 0.0
+            p_ann3.xy = (xi, y_pos)
+            p_ann3.set_text(f"{x_dt[idx].strftime('%Y-%m-%d %H:%M')}\nMargin Used: {y_pos:,.2f} USDT")
+            p_ann3.set_visible(True)
+            p_dot3.set_data([x_dt[idx]], [y_pos])
+            p_dot3.set_visible(True)
+        elif event.inaxes == ax4:
+            if 'tp_dates' in locals() and tp_dates:
+                tp_dates_num = mdates.date2num(tp_dates)
+                tp_idx = int(np.searchsorted(tp_dates_num, mx))
+                tp_idx = max(0, min(tp_idx, len(tp_dates_num) - 1))
+                y_tp = tp_values[tp_idx]
+            else:
+                y_tp = 0.0
+            p_ann4.xy = (xi, y_tp)
+            p_ann4.set_text(f"{x_dt[idx].strftime('%Y-%m-%d %H:%M')}\nTrade PnL: {y_tp:,.2f} USDT")
+            p_ann4.set_visible(True)
+            p_dot4.set_data([x_dt[idx]], [y_tp])
+            p_dot4.set_visible(True)
+        fig.canvas.draw_idle()
+    fig.canvas.mpl_connect('button_press_event', on_click)
     plt.tight_layout()
+    out_dir = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'output')
+    os.makedirs(out_dir, exist_ok=True)
+    ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    out_file = os.path.join(out_dir, f"backtest_{x_dt.min().strftime('%Y%m%d')}_{x_dt.max().strftime('%Y%m%d')}_{ts}.png")
+    fig.savefig(out_file, dpi=150)
     plt.show()
 
 class CryptoCommissionInfo(bt.CommissionInfo):
