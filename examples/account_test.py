@@ -14,7 +14,7 @@ import pandas as pd
 import time
 import os
 import json
-
+# 配置
 _base_dir = os.path.dirname(__file__)
 _local_cfg = os.path.join(_base_dir, 'config.local')
 _cfg_path = _local_cfg if os.path.exists(_local_cfg) else os.path.join(_base_dir, 'config')
@@ -114,6 +114,14 @@ def close_positions_from_recent_trades():
     except Exception as e:
         print('平仓失败:', e)
 
+def load_markets():
+    try:
+        markets = okx.fetch_markets(params={'type': 'swap'})
+        print('市场数量:', len(markets))
+        print('示例市场:', [m.get('symbol') for m in markets[:10]])
+    except Exception as e:
+        print('加载市场失败:', e)
 if __name__ == '__main__':
     # 直接运行平仓操作；如需演示下单与保证金判定，可调用 swap_long()
-    close_positions_from_recent_trades()
+    # close_positions_from_recent_trades()
+    load_markets()

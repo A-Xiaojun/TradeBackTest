@@ -8,73 +8,147 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import numpy as np
 
-import backtrader as bt
-
-class VegasTunnelStrategy(bt.Strategy):
+class RightSidePivotStrategy(bt.Strategy):
+    """
+    右侧交易策略：
+    - 做多：寻找越来越高的低点 (Higher Lows)。当一轮小回调结束，价格重新向上拐头突破时入场。
+    - 做空：寻找越来越低的高点 (Lower Highs)。当反弹结束，价格重新向下拐头跌破时入场。
+    - 仓位：每次信号只使用当前总资金的 10% 进行开仓。
+    - 止损：做多的止损设在最近一个波谷（低点），做空的止损设在最近一个波峰（高点）。
+    """
     params = (
-        ('ema_fast', 144),
-        ('ema_slow', 169),
-        ('stop_loss', 0.01),   # 止损百分比（如1%）
-        ('take_profit', 0.02), # 止盈百分比（如2%）
-        ('size', 1),           # 每次交易数量
+        ('pivot_period', 5),  # 寻找局部高低点的窗口期（左右各看几根K线）
+        ('risk_percent', 0.10), # 每次开仓使用资金比例 (10%)
+        ('leverage', 10.0),   # 新增：杠杆倍数，默认 10x
     )
 
     def __init__(self):
-        self.ema12 = bt.indicators.ExponentialMovingAverage(self.datas[0], period=12)
-        self.ema_fast = bt.indicators.ExponentialMovingAverage(self.datas[0], period=self.p.ema_fast)
-        self.ema_slow = bt.indicators.ExponentialMovingAverage(self.datas[0], period=self.p.ema_slow)
         self.order = None
         self.buyprice = None
         self.buycomm = None
-        
-        # 新增：记录资金曲线、买卖点和仓位以便绘图
+        self.stop_price = None
+
+        # 记录资金曲线、买卖点和仓位以便绘图
         self.trade_markers = {'buy': [], 'sell': []}
         self.equity_curve = []
         self.position_curve = []
+        self.position_value_curve = [] # 新增：记录仓位的名义USDT价值
         self.dt_records = []
+
+        # 记录波峰(Highs)和波谷(Lows)
+        self.highs = []
+        self.lows = []
+        
+        # 记录给绘图用（占位，保持兼容原有绘图代码逻辑）
+        # 如果需要可以在图中绘制，这里复用 ema_fast / ema_slow 的变量名来占位以防报错
+        self.ema_fast = bt.indicators.SMA(self.datas[0], period=10) 
+        self.ema_slow = bt.indicators.SMA(self.datas[0], period=20)
 
     def next(self):
         # 记录每根K线结束后的资金和仓位情况
         self.equity_curve.append(self.broker.getvalue())
         self.position_curve.append(self.position.size)
+        
+        # 记录仓位所占用的保证金成本 (Margin/Cost)
+        # 即：为了持有当前这些仓位，你实际投入了多少本金
+        # 如果是 10x 杠杆，名义价值是 size * price，投入本金大约是 名义价值 / 10
+        # 做空时我们取绝对值，表示占用的资金量
+        current_close = self.datas[0].close[0]
+        pos_value = abs(self.position.size * current_close)
+        margin_used = pos_value / self.p.leverage if self.position.size != 0 else 0.0
+        self.position_value_curve.append(margin_used)
+        
         self.dt_records.append(self.datas[0].datetime.datetime(0))
         
         if self.order:
             return  # 有挂单则不处理
 
-        close = self.datas[0].close[0]
-        ema_fast = self.ema_fast[0]
-        ema_slow = self.ema_slow[0]
+        # 寻找分形高低点 (Fractal Pivots)
+        # 判断当前K线往前推 pivot_period 根K线，是否是局部最高或最低
+        p = self.p.pivot_period
+        
+        # 确保有足够的数据历史
+        if len(self.datas[0]) < p * 2 + 1:
+            return
 
-        # 信号过滤：仅在均线多头排列时做多，空头排列时做空
+        # 获取前后 p 根 K 线的最高价和最低价数组
+        high_slice = self.datas[0].high.get(ago=-p, size=p*2+1)
+        low_slice = self.datas[0].low.get(ago=-p, size=p*2+1)
+        
+        if len(high_slice) != p*2+1:
+            return
+
+        center_high = high_slice[p]
+        center_low = low_slice[p]
+
+        is_pivot_high = all(center_high > h for i, h in enumerate(high_slice) if i != p)
+        is_pivot_low = all(center_low < l for i, l in enumerate(low_slice) if i != p)
+
+        # 记录最近的拐点
+        if is_pivot_high:
+            self.highs.append(center_high)
+            # 保持列表不要太长
+            if len(self.highs) > 5:
+                self.highs.pop(0)
+                
+        if is_pivot_low:
+            self.lows.append(center_low)
+            if len(self.lows) > 5:
+                self.lows.pop(0)
+
+        close = self.datas[0].close[0]
+
+        # ---------------- 交易逻辑 ----------------
         if not self.position:
-            if close > ema_slow and ema_fast > ema_slow:
-                # 多头突破隧道，做多
-                self.order = self.buy(size=self.p.size)
-                self.buyprice = close
-                self.log(f"买入信号: {close:.2f}")
-            elif close < ema_fast and ema_fast < ema_slow:
-                # 空头跌破隧道，做空
-                self.order = self.sell(size=self.p.size)
-                self.buyprice = close
-                self.log(f"卖出信号: {close:.2f}")
+            # 1. 寻找做多机会：越来越高的低点 (Higher Lows) 且向上突破
+            if len(self.lows) >= 2:
+                # 判断最近两个低点是否抬高
+                if self.lows[-1] > self.lows[-2]:
+                    # 确认右侧拐头：当前价格突破了最近的一根阻力K线（简单起见用最近两根K线的高点突破）
+                    recent_high = max(self.datas[0].high[-1], self.datas[0].high[-2])
+                    if close > recent_high:
+                        # 资金管理：计算10%资金能买多少股，并加上杠杆
+                        target_value = self.broker.getvalue() * self.p.risk_percent * self.p.leverage
+                        size = target_value / close
+                        
+                        self.order = self.buy(size=size)
+                        self.stop_price = self.lows[-1] # 止损设在最近的低点拐点
+                        self.log(f"做多信号(Higher Low): 价格={close:.2f}, 止损={self.stop_price:.2f}, 杠杆={self.p.leverage}x")
+
+            # 2. 寻找做空机会：越来越低的高点 (Lower Highs) 且向下跌破
+            if len(self.highs) >= 2 and not self.order:
+                # 判断最近两个高点是否降低
+                if self.highs[-1] < self.highs[-2]:
+                    # 确认右侧拐头：当前价格跌破最近支撑
+                    recent_low = min(self.datas[0].low[-1], self.datas[0].low[-2])
+                    if close < recent_low:
+                        target_value = self.broker.getvalue() * self.p.risk_percent * self.p.leverage
+                        size = target_value / close
+                        
+                        self.order = self.sell(size=size)
+                        self.stop_price = self.highs[-1] # 止损设在最近的高点拐点
+                        self.log(f"做空信号(Lower High): 价格={close:.2f}, 止损={self.stop_price:.2f}, 杠杆={self.p.leverage}x")
+
         else:
-            # 止损止盈逻辑
+            # ---------------- 止损/平仓逻辑 ----------------
             if self.position.size > 0:
-                # 多头持仓
-                if close <= self.buyprice * (1 - self.p.stop_loss):
-                    self.log(f"止损平多: {close:.2f}")
+                # 多头止损
+                if close <= self.stop_price:
+                    self.log(f"多头触及拐点止损平仓: {close:.2f} (止损价: {self.stop_price:.2f})")
                     self.order = self.close()
-                elif close >= self.buyprice * (1 + self.p.take_profit):
-                    self.log(f"止盈平多: {close:.2f}")
+                # 简单止盈：如果出现了降低的高点，说明上涨动能衰竭，平多
+                elif len(self.highs) >= 2 and self.highs[-1] < self.highs[-2]:
+                    self.log(f"多头动能衰竭(出现Lower High)平仓: {close:.2f}")
                     self.order = self.close()
+                    
             elif self.position.size < 0:
-                # 空头持仓
-                if close >= self.buyprice * (1 + self.p.stop_loss):
-                    self.log(f"止损平空: {close:.2f}")
+                # 空头止损
+                if close >= self.stop_price:
+                    self.log(f"空头触及拐点止损平仓: {close:.2f} (止损价: {self.stop_price:.2f})")
                     self.order = self.close()
-                elif close <= self.buyprice * (1 - self.p.take_profit):
-                    self.log(f"止盈平空: {close:.2f}")
+                # 简单止盈：如果出现了抬高的低点，说明下跌动能衰竭，平空
+                elif len(self.lows) >= 2 and self.lows[-1] > self.lows[-2]:
+                    self.log(f"空头动能衰竭(出现Higher Low)平仓: {close:.2f}")
                     self.order = self.close()
 
     def log(self, txt, dt=None):
@@ -85,10 +159,10 @@ class VegasTunnelStrategy(bt.Strategy):
         if order.status in [order.Completed]:
             dt = self.datas[0].datetime.datetime(0)
             if order.isbuy():
-                self.log(f'买入成交: {order.executed.price:.2f}')
+                self.log(f'买入成交: {order.executed.price:.2f}, 数量: {order.executed.size:.4f}')
                 self.trade_markers['buy'].append((dt, order.executed.price))
             elif order.issell():
-                self.log(f'卖出成交: {order.executed.price:.2f}')
+                self.log(f'卖出成交: {order.executed.price:.2f}, 数量: {order.executed.size:.4f}')
                 self.trade_markers['sell'].append((dt, order.executed.price))
             self.buyprice = order.executed.price
             self.buycomm = order.executed.comm
@@ -101,7 +175,7 @@ class VegasTunnelStrategy(bt.Strategy):
             self.log(f'交易结束, 毛利润: {trade.pnl:.2f}, 净利润: {trade.pnlcomm:.2f}')
 
 
-def plot_results(df_plot, strat, initial_cash=1000000.0):
+def plot_results(df_plot, strat, initial_cash):
     """
     封装策略回测后的可视化绘图逻辑
     """
@@ -135,6 +209,12 @@ def plot_results(df_plot, strat, initial_cash=1000000.0):
     ax1.set_ylabel('Price (USD)', fontsize=12)
     ax1.legend(loc='upper left')
     ax1.grid(True, alpha=0.3)
+    # 调整Y轴范围避免从0开始
+    y_stack = np.vstack([df_plot['close'].values, df_plot['ema_fast'].values, df_plot['ema_slow'].values])
+    y_min = float(np.nanmin(y_stack))
+    y_max = float(np.nanmax(y_stack))
+    pad = (y_max - y_min) * 0.02 if y_max > y_min else 1.0
+    ax1.set_ylim(y_min - pad, y_max + pad)
     
     # 2. 资金曲线 (Equity)
     ax2.plot(strat.dt_records, strat.equity_curve, '-', color='purple', linewidth=1.5, label='Portfolio Value')
@@ -149,11 +229,11 @@ def plot_results(df_plot, strat, initial_cash=1000000.0):
     ax2.legend(loc='upper left')
     ax2.grid(True, alpha=0.3)
     
-    # 3. 仓位曲线 (Position)
-    ax3.step(strat.dt_records, strat.position_curve, where='post', color='#17becf', linewidth=1.5, label='Position Size')
-    ax3.fill_between(strat.dt_records, strat.position_curve, 0, step='post', alpha=0.3, color='#17becf')
+    # 3. 仓位价值曲线 (Position Value in USDT)
+    ax3.plot(strat.dt_records, strat.position_value_curve, '-', color='#17becf', linewidth=1.5, label='Margin Used (USDT)')
+    ax3.fill_between(strat.dt_records, strat.position_value_curve, 0, alpha=0.3, color='#17becf')
     ax3.axhline(y=0, color='black', linewidth=1.0, alpha=0.5)
-    ax3.set_ylabel('Position', fontsize=12)
+    ax3.set_ylabel('Margin (USDT)', fontsize=12)
     ax3.legend(loc='upper left')
     ax3.grid(True, alpha=0.3)
     
@@ -226,10 +306,10 @@ def plot_results(df_plot, strat, initial_cash=1000000.0):
         y_ema_f = float(df_plot['ema_fast'].iat[idx])
         y_ema_s = float(df_plot['ema_slow'].iat[idx])
         
-        # 匹配对应时间点的资金和仓位 (如果有)
+        # 匹配对应时间点的资金和仓位价值 (如果有)
         eq_idx = min(idx, len(strat.equity_curve) - 1)
         y_eq = float(strat.equity_curve[eq_idx]) if eq_idx >= 0 else initial_cash
-        y_pos = float(strat.position_curve[eq_idx]) if eq_idx >= 0 else 0.0
+        y_pos = float(strat.position_value_curve[eq_idx]) if eq_idx >= 0 else 0.0
         
         # 匹配对应时间点的日收益率
         dr_dates_num = mdates.date2num(dr_dates) if dr_dates else []
@@ -258,7 +338,7 @@ def plot_results(df_plot, strat, initial_cash=1000000.0):
             hline2.set_visible(True)
         elif event.inaxes == ax3:
             ann3.xy = (xi, y_pos)
-            ann3.set_text(f"{x_dt[idx].strftime('%Y-%m-%d %H:%M')}\nPosition: {y_pos}")
+            ann3.set_text(f"{x_dt[idx].strftime('%Y-%m-%d %H:%M')}\nMargin Used: {y_pos:,.2f} USDT")
             ann3.set_visible(True)
             hline3.set_ydata([y_pos, y_pos])
             hline3.set_visible(True)
@@ -279,12 +359,27 @@ def plot_results(df_plot, strat, initial_cash=1000000.0):
     plt.tight_layout()
     plt.show()
 
+class CryptoCommissionInfo(bt.CommissionInfo):
+    params = (
+        ('commission', 0.0008), # 0.08% 佣金
+        ('mult', 1.0),
+        ('margin', None),      # 使用杠杆时需要设置保证金比例，或通过下面覆盖来模拟
+        ('commtype', bt.CommInfoBase.COMM_PERC),
+        ('stocklike', False),
+        ('leverage', 10.0),    # 允许 10 倍杠杆
+    )
+
+    def getsize(self, price, cash):
+        """覆盖该方法使得 broker 认为资金足够"""
+        return (cash * self.p.leverage) / price
+
 def my_strage():
     print("开始回测...")
     # 创建Cerebro引擎  
     cerebro = bt.Cerebro() 
 
-    cerebro.addstrategy(VegasTunnelStrategy)
+    # 替换为新的右侧拐点策略
+    cerebro.addstrategy(RightSidePivotStrategy)
     # 获取当前运行脚本所在目录  
     modpath = os.path.dirname(os.path.abspath(sys.argv[0]))
 
@@ -308,20 +403,25 @@ def my_strage():
     cerebro.adddata(data)
     # 设置投资金额100000.0 
     cerebro.broker.setcash(1000000.0) 
-    cerebro.broker.setcommission(commission=0.001)
+    
+    # 因为加了 10x 杠杆，需要确保券商允许使用保证金(margin)交易，避免现金不足被拒绝
+    comminfo = CryptoCommissionInfo()
+    cerebro.broker.addcommissioninfo(comminfo)
+    cerebro.broker.set_checksubmit(False) # 允许不检查现金是否足够（模拟杠杆借贷）
     
     # 新增：添加收益率分析器
     cerebro.addanalyzer(bt.analyzers.TimeReturn, _name='timereturn')
     
     # 引擎运行前打印期出资金  
-    print('组合期初资金: %.2f' % cerebro.broker.getvalue()) 
+    initial_cash = cerebro.broker.getvalue()
+    print('组合期初资金: %.2f' % initial_cash) 
     results = cerebro.run() 
     strat = results[0]
     # 引擎运行后打期末资金  
     print('组合期末资金: %.2f' % cerebro.broker.getvalue())
     
     # 调用绘图函数
-    plot_results(df_plot, strat, initial_cash=1000000.0)
+    plot_results(df_plot, strat, initial_cash=initial_cash)
 
 if __name__ == "__main__":
     my_strage()

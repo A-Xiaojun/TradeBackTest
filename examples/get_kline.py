@@ -1,5 +1,7 @@
+#
 import ccxt
 import pandas as pd
+import Matplotlib as plt
 
 def fetch_okx_kline(symbol, timeframe, limit, filename):
     exchange = ccxt.okx({
@@ -9,6 +11,7 @@ def fetch_okx_kline(symbol, timeframe, limit, filename):
             'https': 'http://127.0.0.1:7897',
         }
     })
+    #得到最新数据
     ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
