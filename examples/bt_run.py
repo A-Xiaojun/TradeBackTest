@@ -42,6 +42,12 @@ class RightSidePivotStrategy(bt.Strategy):
         self.equity_curve = []
         self.position_curve = []
         self.position_value_curve = [] # 新增：记录仓位的名义USDT价值
+        # 扩展的标记分类：建仓/加仓/平仓(盈亏)
+        self.marker_entry_long = []
+        self.marker_entry_short = []
+        self.marker_add_long = []
+        self.marker_add_short = []
+        self.close_points = []  # (dt, price, pnlcomm)
         self.trade_pnls = []
         self.dt_records = []
 
@@ -189,9 +195,26 @@ class RightSidePivotStrategy(bt.Strategy):
             if order.isbuy():
                 self.log(f'买入成交: {order.executed.price:.2f}, 数量: {order.executed.size:.4f}')
                 self.trade_markers['buy'].append((dt, order.executed.price))
+                # 分类：建仓/加仓/反手
+                new_size = float(self.position.size)
+                exec_size = float(order.executed.size)
+                prior_size = new_size - exec_size
+                price = float(order.executed.price)
+                if abs(prior_size) < 1e-12 and new_size > 0:
+                    self.marker_entry_long.append((dt, price))
+                elif prior_size > 0 and new_size > prior_size:
+                    self.marker_add_long.append((dt, price))
             elif order.issell():
                 self.log(f'卖出成交: {order.executed.price:.2f}, 数量: {order.executed.size:.4f}')
                 self.trade_markers['sell'].append((dt, order.executed.price))
+                new_size = float(self.position.size)
+                exec_size = float(order.executed.size)
+                prior_size = new_size - exec_size
+                price = float(order.executed.price)
+                if abs(prior_size) < 1e-12 and new_size < 0:
+                    self.marker_entry_short.append((dt, price))
+                elif prior_size < 0 and abs(new_size) > abs(prior_size):
+                    self.marker_add_short.append((dt, price))
             self.buyprice = order.executed.price
             self.buycomm = order.executed.comm
         elif order.status in [order.Canceled, order.Margin, order.Rejected]:
@@ -204,6 +227,9 @@ class RightSidePivotStrategy(bt.Strategy):
             self.stop_price = None
             dt = self.datas[0].datetime.datetime(0)
             self.trade_pnls.append((dt, float(trade.pnlcomm)))
+            # 记录平仓点（用于图1 Close Win/Loss）
+            pr = float(self.datas[0].close[0])
+            self.close_points.append((dt, pr, float(trade.pnlcomm)))
             self.last_exit_bar = self.bar_count
 
 
@@ -224,15 +250,41 @@ def plot_results(df_plot, strat, initial_cash):
     ax1.plot(x_dt, df_plot['ema_fast'].values, '--', label='EMA(144)', color='#ff7f0e', linewidth=1.5)
     ax1.plot(x_dt, df_plot['ema_slow'].values, '--', label='EMA(169)', color='#2ca02c', linewidth=1.5)
     
-    # 绘制买卖点
+    # 绘制买卖点（区分建仓/加仓/平仓）
     buys_dt = [m[0] for m in strat.trade_markers['buy']]
     buys_p = [m[1] for m in strat.trade_markers['buy']]
     sells_dt = [m[0] for m in strat.trade_markers['sell']]
     sells_p = [m[1] for m in strat.trade_markers['sell']]
     
-    if buys_dt:
+    if hasattr(strat, 'marker_entry_long') and strat.marker_entry_long:
+        e_dt = [d for d, _ in strat.marker_entry_long]
+        e_p = [p for _, p in strat.marker_entry_long]
+        ax1.scatter(e_dt, e_p, marker='^', color='red', s=120, label='Entry Long', zorder=6)
+    if hasattr(strat, 'marker_entry_short') and strat.marker_entry_short:
+        e_dt = [d for d, _ in strat.marker_entry_short]
+        e_p = [p for _, p in strat.marker_entry_short]
+        ax1.scatter(e_dt, e_p, marker='v', color='blue', s=120, label='Entry Short', zorder=6)
+    if hasattr(strat, 'marker_add_long') and strat.marker_add_long:
+        a_dt = [d for d, _ in strat.marker_add_long]
+        a_p = [p for _, p in strat.marker_add_long]
+        ax1.scatter(a_dt, a_p, marker='D', color='#ff7f0e', s=70, label='Add Long', zorder=6)
+    if hasattr(strat, 'marker_add_short') and strat.marker_add_short:
+        a_dt = [d for d, _ in strat.marker_add_short]
+        a_p = [p for _, p in strat.marker_add_short]
+        ax1.scatter(a_dt, a_p, marker='D', color='#17becf', s=70, label='Add Short', zorder=6)
+    if hasattr(strat, 'close_points') and strat.close_points:
+        c_pos_dt = [d for d, _, pnl in strat.close_points if pnl >= 0]
+        c_pos_p = [p for d, p, pnl in strat.close_points if pnl >= 0]
+        c_neg_dt = [d for d, _, pnl in strat.close_points if pnl < 0]
+        c_neg_p = [p for d, p, pnl in strat.close_points if pnl < 0]
+        if c_pos_dt:
+            ax1.scatter(c_pos_dt, c_pos_p, marker='x', color='green', s=140, linewidths=2.2, label='Close (Win)', zorder=7)
+        if c_neg_dt:
+            ax1.scatter(c_neg_dt, c_neg_p, marker='x', color='red', s=140, linewidths=2.2, label='Close (Loss)', zorder=7)
+    # 回退：若老的 buy/sell 存在，作为补充（以兼容早期数据）
+    if buys_dt and not getattr(strat, 'marker_entry_long', None):
         ax1.scatter(buys_dt, buys_p, marker='^', color='red', s=120, label='Buy', zorder=5)
-    if sells_dt:
+    if sells_dt and not getattr(strat, 'marker_entry_short', None):
         ax1.scatter(sells_dt, sells_p, marker='v', color='green', s=120, label='Sell', zorder=5)
         
     ax1.set_title('BTC-USD Trading Strategy', fontsize=14, fontweight='bold')
