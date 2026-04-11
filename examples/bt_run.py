@@ -28,6 +28,7 @@ class RightSidePivotStrategy(bt.Strategy):
         ('bb_bandwidth_threshold', 0.010),
         ('min_swing_atr_mult', 0.6),
         ('breakout_buffer_atr_mult', 0.10),
+        ('min_ema_spread_pct', 0.003),  # EMA发散阈值：过小视为震荡
         ('cooldown_bars', 2),
     )
 
@@ -127,41 +128,37 @@ class RightSidePivotStrategy(bt.Strategy):
             bb_width = (self.bb.top[0] - self.bb.bot[0]) / abs(close)
         if not self.position and (self.bar_count - self.last_exit_bar) <= self.p.cooldown_bars:
             return
-        if (bb_width < self.p.bb_bandwidth_threshold) and (self.adx[0] < self.p.adx_threshold):
+        ema_spread = 0.0
+        if close != 0:
+            ema_spread = abs(self.ema_fast[0] - self.ema_slow[0]) / abs(close)
+        # 更严格的震荡过滤：任一条件不满足都跳过（低ADX / 带宽窄 / EMA粘合）
+        if (self.adx[0] < self.p.adx_threshold) or (bb_width < self.p.bb_bandwidth_threshold) or (ema_spread < self.p.min_ema_spread_pct):
             return
 
         # ---------------- 交易逻辑 ----------------
         if not self.position:
-            # 1. 寻找做多机会：越来越高的低点 (Higher Lows) 且向上突破
+            # 1. 寻找做多机会：形成越来越高的低点 (Higher Lows) 即入场
             if len(self.lows) >= 2:
                 # 判断最近两个低点是否抬高
                 swing_ok = (self.lows[-1] - self.lows[-2]) >= self.p.min_swing_atr_mult * max(self.atr[0], 1e-9)
                 if self.lows[-1] > self.lows[-2] and swing_ok:
-                    # 确认右侧拐头：当前价格突破了最近的一根阻力K线（简单起见用最近两根K线的高点突破）
-                    recent_high = max(self.datas[0].high[-1], self.datas[0].high[-2])
-                    if close > (recent_high + self.p.breakout_buffer_atr_mult * self.atr[0]):
-                        # 资金管理：计算10%资金能买多少股，并加上杠杆
-                        target_value = self.broker.getvalue() * self.p.risk_percent * self.p.leverage
-                        size = target_value / close
-                        
-                        self.order = self.buy(size=size)
-                        self.stop_price = self.lows[-1] # 止损设在最近的低点拐点
-                        self.log(f"做多信号(Higher Low): 价格={close:.2f}, 止损={self.stop_price:.2f}, 杠杆={self.p.leverage}x")
+                    # 资金管理：计算10%资金能买多少股，并加上杠杆
+                    target_value = self.broker.getvalue() * self.p.risk_percent * self.p.leverage
+                    size = target_value / close
+                    self.order = self.buy(size=size)
+                    self.stop_price = self.lows[-1] # 止损设在最近的低点拐点
+                    self.log(f"做多信号(Higher Low): 价格={close:.2f}, 止损={self.stop_price:.2f}, 杠杆={self.p.leverage}x")
 
-            # 2. 寻找做空机会：越来越低的高点 (Lower Highs) 且向下跌破
+            # 2. 寻找做空机会：形成越来越低的高点 (Lower Highs) 即入场
             if len(self.highs) >= 2 and not self.order:
                 # 判断最近两个高点是否降低
                 swing_ok = (self.highs[-2] - self.highs[-1]) >= self.p.min_swing_atr_mult * max(self.atr[0], 1e-9)
                 if self.highs[-1] < self.highs[-2] and swing_ok:
-                    # 确认右侧拐头：当前价格跌破最近支撑
-                    recent_low = min(self.datas[0].low[-1], self.datas[0].low[-2])
-                    if close < (recent_low - self.p.breakout_buffer_atr_mult * self.atr[0]):
-                        target_value = self.broker.getvalue() * self.p.risk_percent * self.p.leverage
-                        size = target_value / close
-                        
-                        self.order = self.sell(size=size)
-                        self.stop_price = self.highs[-1] # 止损设在最近的高点拐点
-                        self.log(f"做空信号(Lower High): 价格={close:.2f}, 止损={self.stop_price:.2f}, 杠杆={self.p.leverage}x")
+                    target_value = self.broker.getvalue() * self.p.risk_percent * self.p.leverage
+                    size = target_value / close
+                    self.order = self.sell(size=size)
+                    self.stop_price = self.highs[-1] # 止损设在最近的高点拐点
+                    self.log(f"做空信号(Lower High): 价格={close:.2f}, 止损={self.stop_price:.2f}, 杠杆={self.p.leverage}x")
 
         else:
             # ---------------- 止损/平仓逻辑 ----------------
