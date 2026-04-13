@@ -14,9 +14,11 @@ DATA_SOURCES = {
     "btc_1h_new": "BTCUSD_1H_20260412_062757.csv",
     "btc_1h_old": "BTC-USD_1H_20251111_221506.csv",
     "btc_15m": "BTCUSD_15M_20260328_131652.csv",
-    "eth_15m": "ETHUSD_15M_20260413_105553.csv",
+    "eth_15m_105553": "ETHUSD_15M_20260413_105553.csv",
+    "eth_15m_new": "ETHUSD_15M_20260413_115652.csv",
 }
-ACTIVE_DATA_SOURCE = "eth_15m"  # 在这里切换数据源键
+ACTIVE_DATA_SOURCE = "eth_15m_new"  # 在这里切换数据源键
+DATA_SOURCE_SUBDIR = os.path.join("output", "kline")
 
 class RightSidePivotStrategy(bt.Strategy):
     """
@@ -31,6 +33,8 @@ class RightSidePivotStrategy(bt.Strategy):
         ('risk_percent', 0.10), # 每次开仓使用资金比例 (10%)
         ('leverage', 10.0),   # 新增：杠杆倍数，默认 10x
         ('order_utilization', 0.95),  # 可用保证金利用率，预留手续费缓冲避免拒单
+        ('auto_topup_to_initial', True),  # 当前资金低于期初时，自动补到期初
+        ('auto_withdraw_profit', True),   # 当前资金高于期初时，自动取出利润
         ('atr_period', 14),
         ('adx_period', 14),
         ('adx_threshold', 18.0),
@@ -49,12 +53,20 @@ class RightSidePivotStrategy(bt.Strategy):
         self.buycomm = None
         self.stop_price = None
         self.initial_equity = None  # 记录期初资金，用于固定仓位
+        # 资金流记账（用于计算真实盈亏）
+        self.cum_withdraw = 0.0          # 累计取出
+        self.cum_topup_external = 0.0    # 累计外部补资
+        self.profit_pool = 0.0           # 盈利池（从账户取出的利润，可回补）
 
         # 记录资金曲线、买卖点和仓位以便绘图
         self.trade_markers = {'buy': [], 'sell': []}
         self.equity_curve = []
         self.position_curve = []
         self.position_value_curve = [] # 新增：记录仓位的名义USDT价值
+        self.real_pnl_curve = []        # 真实累计盈亏曲线（扣除外部补资、加回取出）
+        self.withdraw_curve = []        # 累计取出曲线
+        self.external_topup_curve = []  # 累计外部补资曲线
+        self.profit_pool_curve = []     # 盈利池余额曲线
         # 扩展的标记分类：建仓/加仓/平仓(盈亏)
         self.marker_entry_long = []
         self.marker_entry_short = []
@@ -90,13 +102,52 @@ class RightSidePivotStrategy(bt.Strategy):
         size = notional / close
         return max(size, 0.0)
 
+    def _apply_cashflow_policy(self):
+        """空仓时执行资金流策略：盈利取出、亏损回补（优先盈利池）。"""
+        if self.initial_equity is None:
+            return
+        current_value = float(self.broker.getvalue())
+        eps = 1e-9
+        # 情况1：盈利取出
+        if self.p.auto_withdraw_profit and current_value > self.initial_equity + eps:
+            amount = current_value - self.initial_equity
+            if hasattr(self.broker, "add_cash"):
+                self.broker.add_cash(-amount)
+            else:
+                self.broker.setcash(float(self.broker.getcash()) - amount)
+            self.cum_withdraw += amount
+            self.profit_pool += amount
+            self.log(f"盈利取出: {amount:.2f}, 盈利池={self.profit_pool:.2f}")
+            return
+
+        # 情况2：亏损补资（先用盈利池，不足部分记外部补资）
+        if self.p.auto_topup_to_initial and current_value < self.initial_equity - eps:
+            deficit = self.initial_equity - current_value
+            from_pool = min(deficit, self.profit_pool)
+            external = deficit - from_pool
+            if hasattr(self.broker, "add_cash"):
+                self.broker.add_cash(deficit)
+            else:
+                self.broker.setcash(float(self.broker.getcash()) + deficit)
+            self.profit_pool -= from_pool
+            self.cum_topup_external += external
+            self.log(f"亏损补资: {deficit:.2f} (盈利池={from_pool:.2f}, 外部={external:.2f}), 盈利池={self.profit_pool:.2f}")
+
     def next(self):
         if self.initial_equity is None:
             self.initial_equity = float(self.broker.getvalue())
+        # 仅在空仓且无挂单时补资，避免干扰在途订单与持仓估值
+        if not self.position and not self.order:
+            self._apply_cashflow_policy()
 
         # 记录每根K线结束后的资金和仓位情况
         self.equity_curve.append(self.broker.getvalue())
         self.position_curve.append(self.position.size)
+        real_pnl = float(self.broker.getvalue()) + self.cum_withdraw - self.cum_topup_external - self.initial_equity
+        self.real_pnl_curve.append(real_pnl)
+        self.withdraw_curve.append(self.cum_withdraw)
+        self.external_topup_curve.append(self.cum_topup_external)
+        self.profit_pool_curve.append(self.profit_pool)
         
         # 记录仓位所占用的保证金成本 (Margin/Cost)
         # 即：为了持有当前这些仓位，你实际投入了多少本金
@@ -262,7 +313,9 @@ def plot_results(df_plot, strat, initial_cash):
     封装策略回测后的可视化绘图逻辑
     """
     # ---------------- 绘图设置 ----------------
-    fig, (ax1, ax2, ax3, ax4) = plt.subplots(4, 1, figsize=(14, 14), sharex=True, gridspec_kw={'height_ratios': [3, 1, 1, 1]})
+    fig, (ax1, ax2, ax3, ax4, ax5) = plt.subplots(
+        5, 1, figsize=(14, 16), sharex=True, gridspec_kw={'height_ratios': [3, 1, 1, 1, 1]}
+    )
     fig.canvas.manager.set_window_title('Backtest Results - Vegas Tunnel')
     
     x_dt = df_plot.index
@@ -364,16 +417,25 @@ def plot_results(df_plot, strat, initial_cash):
     ax4.axhline(y=0, color='black', linewidth=1.0, alpha=0.5)
     
     ax4.set_ylabel('Trade PnL (USDT)', fontsize=12)
-    ax4.set_xlabel('Time', fontsize=12)
     ax4.legend(loc='upper left', fontsize=8, frameon=True, framealpha=0.8, borderpad=0.3, labelspacing=0.3, handlelength=1.5)
     ax4.grid(True, alpha=0.3)
+
+    # 5. 真实盈亏与资金流
+    ax5.plot(strat.dt_records, strat.real_pnl_curve, '-', color='#1f77b4', linewidth=1.5, label='Real PnL')
+    ax5.plot(strat.dt_records, strat.withdraw_curve, '--', color='green', linewidth=1.0, alpha=0.8, label='Cum Withdraw')
+    ax5.plot(strat.dt_records, strat.external_topup_curve, '--', color='red', linewidth=1.0, alpha=0.8, label='Cum External Topup')
+    ax5.axhline(y=0, color='black', linewidth=1.0, alpha=0.5)
+    ax5.set_ylabel('Real PnL', fontsize=12)
+    ax5.set_xlabel('Time', fontsize=12)
+    ax5.legend(loc='upper left', fontsize=8, frameon=True, framealpha=0.8, borderpad=0.3, labelspacing=0.3, handlelength=1.5)
+    ax5.grid(True, alpha=0.3)
     
     # 时间轴格式化
     locator = mdates.AutoDateLocator(minticks=5, maxticks=8)
     formatter = mdates.ConciseDateFormatter(locator)
-    ax4.xaxis.set_major_locator(locator)
-    ax4.xaxis.set_major_formatter(formatter)
-    ax4.set_xlim(x_dt.min(), x_dt.max())
+    ax5.xaxis.set_major_locator(locator)
+    ax5.xaxis.set_major_formatter(formatter)
+    ax5.set_xlim(x_dt.min(), x_dt.max())
     
     # ---------------- 交互注释与十字线 ----------------
     ann_kw = dict(xy=(0, 0), xytext=(15, 15), textcoords='offset points',
@@ -383,42 +445,48 @@ def plot_results(df_plot, strat, initial_cash):
     ann2 = ax2.annotate('', **ann_kw)
     ann3 = ax3.annotate('', **ann_kw)
     ann4 = ax4.annotate('', **ann_kw)
+    ann5 = ax5.annotate('', **ann_kw)
     p_ann1 = ax1.annotate('', **ann_kw)
     p_ann2 = ax2.annotate('', **ann_kw)
     p_ann3 = ax3.annotate('', **ann_kw)
     p_ann4 = ax4.annotate('', **ann_kw)
+    p_ann5 = ax5.annotate('', **ann_kw)
     
-    for ann in [ann1, ann2, ann3, ann4, p_ann1, p_ann2, p_ann3, p_ann4]:
+    for ann in [ann1, ann2, ann3, ann4, ann5, p_ann1, p_ann2, p_ann3, p_ann4, p_ann5]:
         ann.set_visible(False)
     
     vline1 = ax1.axvline(x=x_dt[0], color='black', alpha=0.4, linestyle='--')
     vline2 = ax2.axvline(x=x_dt[0], color='black', alpha=0.4, linestyle='--')
     vline3 = ax3.axvline(x=x_dt[0], color='black', alpha=0.4, linestyle='--')
     vline4 = ax4.axvline(x=x_dt[0], color='black', alpha=0.4, linestyle='--')
+    vline5 = ax5.axvline(x=x_dt[0], color='black', alpha=0.4, linestyle='--')
     
     hline1 = ax1.axhline(y=0, color='black', alpha=0.4, linestyle='--')
     hline2 = ax2.axhline(y=0, color='black', alpha=0.4, linestyle='--')
     hline3 = ax3.axhline(y=0, color='black', alpha=0.4, linestyle='--')
     hline4 = ax4.axhline(y=0, color='black', alpha=0.4, linestyle='--')
+    hline5 = ax5.axhline(y=0, color='black', alpha=0.4, linestyle='--')
     
-    vlines = [vline1, vline2, vline3, vline4]
-    hlines = [hline1, hline2, hline3, hline4]
+    vlines = [vline1, vline2, vline3, vline4, vline5]
+    hlines = [hline1, hline2, hline3, hline4, hline5]
     
     p_dot1, = ax1.plot([], [], 'o', color='#1f77b4', markersize=6, alpha=0.9, zorder=6)
     p_dot2, = ax2.plot([], [], 'o', color='purple', markersize=6, alpha=0.9, zorder=6)
     p_dot3, = ax3.plot([], [], 'o', color='#17becf', markersize=6, alpha=0.9, zorder=6)
     p_dot4, = ax4.plot([], [], 'o', color='gray', markersize=6, alpha=0.9, zorder=6)
+    p_dot5, = ax5.plot([], [], 'o', color='#1f77b4', markersize=6, alpha=0.9, zorder=6)
     p_dot1.set_visible(False)
     p_dot2.set_visible(False)
     p_dot3.set_visible(False)
     p_dot4.set_visible(False)
+    p_dot5.set_visible(False)
     
     for line in vlines + hlines:
         line.set_visible(False)
     
     def on_move(event):
         if not event.inaxes:
-            for item in [ann1, ann2, ann3, ann4] + vlines + hlines:
+            for item in [ann1, ann2, ann3, ann4, ann5] + vlines + hlines:
                 item.set_visible(False)
             fig.canvas.draw_idle()
             return
@@ -450,7 +518,7 @@ def plot_results(df_plot, strat, initial_cash):
             
         # 隐藏所有横线和注释
         for h in hlines: h.set_visible(False)
-        for a in [ann1, ann2, ann3, ann4]: a.set_visible(False)
+        for a in [ann1, ann2, ann3, ann4, ann5]: a.set_visible(False)
             
         if event.inaxes == ax1:
             ann1.xy = (xi, y_close)
@@ -476,6 +544,13 @@ def plot_results(df_plot, strat, initial_cash):
             ann4.set_visible(True)
             hline4.set_ydata([y_tp, y_tp])
             hline4.set_visible(True)
+        elif event.inaxes == ax5:
+            y_real = float(strat.real_pnl_curve[eq_idx]) if eq_idx >= 0 else 0.0
+            ann5.xy = (xi, y_real)
+            ann5.set_text(f"{x_dt[idx].strftime('%Y-%m-%d %H:%M')}\nReal PnL: {y_real:,.2f}")
+            ann5.set_visible(True)
+            hline5.set_ydata([y_real, y_real])
+            hline5.set_visible(True)
             
         for v in vlines:
             v.set_xdata([xi, xi])
@@ -529,6 +604,14 @@ def plot_results(df_plot, strat, initial_cash):
             p_ann4.set_visible(True)
             p_dot4.set_data([x_dt[idx]], [y_tp])
             p_dot4.set_visible(True)
+        elif event.inaxes == ax5:
+            eq_idx = min(idx, len(strat.real_pnl_curve) - 1)
+            y_real = float(strat.real_pnl_curve[eq_idx]) if eq_idx >= 0 else 0.0
+            p_ann5.xy = (xi, y_real)
+            p_ann5.set_text(f"{x_dt[idx].strftime('%Y-%m-%d %H:%M')}\nReal PnL: {y_real:,.2f}")
+            p_ann5.set_visible(True)
+            p_dot5.set_data([x_dt[idx]], [y_real])
+            p_dot5.set_visible(True)
         fig.canvas.draw_idle()
     fig.canvas.mpl_connect('button_press_event', on_click)
     plt.tight_layout()
@@ -567,7 +650,7 @@ def my_strage():
     data_file = DATA_SOURCES.get(ACTIVE_DATA_SOURCE)
     if not data_file:
         raise ValueError(f"无效的数据源键: {ACTIVE_DATA_SOURCE}，可选: {list(DATA_SOURCES.keys())}")
-    data_path = os.path.join(modpath, "..", data_file)
+    data_path = os.path.join(modpath, "..", DATA_SOURCE_SUBDIR, data_file)
     df = pd.read_csv(data_path, parse_dates=['datetime'])
     print(f"当前数据源: {ACTIVE_DATA_SOURCE} -> {data_file}")
     print("数据长度：", len(df))  # df 是你的 DataFrame
@@ -604,6 +687,11 @@ def my_strage():
     strat = results[0]
     # 引擎运行后打期末资金  
     print('组合期末资金: %.2f' % cerebro.broker.getvalue())
+    if strat.real_pnl_curve:
+        print('累计取出: %.2f' % strat.cum_withdraw)
+        print('累计外部补资: %.2f' % strat.cum_topup_external)
+        print('盈利池余额: %.2f' % strat.profit_pool)
+        print('真实累计盈亏: %.2f' % strat.real_pnl_curve[-1])
     
     # 调用绘图函数
     plot_results(df_plot, strat, initial_cash=initial_cash)
