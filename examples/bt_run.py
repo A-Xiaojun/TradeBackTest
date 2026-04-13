@@ -8,6 +8,16 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import numpy as np
 
+# ---------------- 数据源配置（只需改这里） ----------------
+DATA_SOURCES = {
+    "eth_1h": "ETHUSD_1H_20260413_104040.csv",
+    "btc_1h_new": "BTCUSD_1H_20260412_062757.csv",
+    "btc_1h_old": "BTC-USD_1H_20251111_221506.csv",
+    "btc_15m": "BTCUSD_15M_20260328_131652.csv",
+    "eth_15m": "ETHUSD_15M_20260413_105553.csv",
+}
+ACTIVE_DATA_SOURCE = "eth_15m"  # 在这里切换数据源键
+
 class RightSidePivotStrategy(bt.Strategy):
     """
     右侧交易策略：
@@ -20,6 +30,7 @@ class RightSidePivotStrategy(bt.Strategy):
         ('pivot_period', 5),  # 寻找局部高低点的窗口期（左右各看几根K线）
         ('risk_percent', 0.10), # 每次开仓使用资金比例 (10%)
         ('leverage', 10.0),   # 新增：杠杆倍数，默认 10x
+        ('order_utilization', 0.95),  # 可用保证金利用率，预留手续费缓冲避免拒单
         ('atr_period', 14),
         ('adx_period', 14),
         ('adx_threshold', 18.0),
@@ -67,6 +78,17 @@ class RightSidePivotStrategy(bt.Strategy):
         self.atr = bt.indicators.ATR(self.datas[0], period=self.p.atr_period)
         self.adx = bt.indicators.AverageDirectionalMovementIndex(self.datas[0], period=self.p.adx_period)
         self.bb = bt.indicators.BollingerBands(self.datas[0], period=self.p.bb_period, devfactor=self.p.bb_dev)
+
+    def _calc_order_size(self, close: float) -> float:
+        """按期初资金目标下单，并受当前可用保证金约束，尽量避免保证金拒单。"""
+        if close <= 0:
+            return 0.0
+        target_value = self.initial_equity * self.p.risk_percent * self.p.leverage
+        available_cash = max(float(self.broker.getcash()), 0.0)
+        max_notional_now = available_cash * self.p.leverage * self.p.order_utilization
+        notional = min(target_value, max_notional_now)
+        size = notional / close
+        return max(size, 0.0)
 
     def next(self):
         if self.initial_equity is None:
@@ -146,9 +168,9 @@ class RightSidePivotStrategy(bt.Strategy):
                 # 判断最近两个低点是否抬高
                 swing_ok = (self.lows[-1] - self.lows[-2]) >= self.p.min_swing_atr_mult * max(self.atr[0], 1e-9)
                 if self.lows[-1] > self.lows[-2] and swing_ok:
-                    # 资金管理：固定按“期初资金的10%”计算每笔仓位，再乘杠杆
-                    target_value = self.initial_equity * self.p.risk_percent * self.p.leverage
-                    size = target_value / close
+                    size = self._calc_order_size(close)
+                    if size <= 0:
+                        return
                     self.order = self.buy(size=size)
                     self.stop_price = self.lows[-1] # 止损设在最近的低点拐点
                     self.log(f"做多信号(Higher Low): 价格={close:.2f}, 止损={self.stop_price:.2f}, 杠杆={self.p.leverage}x")
@@ -158,8 +180,9 @@ class RightSidePivotStrategy(bt.Strategy):
                 # 判断最近两个高点是否降低
                 swing_ok = (self.highs[-2] - self.highs[-1]) >= self.p.min_swing_atr_mult * max(self.atr[0], 1e-9)
                 if self.highs[-1] < self.highs[-2] and swing_ok:
-                    target_value = self.initial_equity * self.p.risk_percent * self.p.leverage
-                    size = target_value / close
+                    size = self._calc_order_size(close)
+                    if size <= 0:
+                        return
                     self.order = self.sell(size=size)
                     self.stop_price = self.highs[-1] # 止损设在最近的高点拐点
                     self.log(f"做空信号(Lower High): 价格={close:.2f}, 止损={self.stop_price:.2f}, 杠杆={self.p.leverage}x")
@@ -219,7 +242,7 @@ class RightSidePivotStrategy(bt.Strategy):
             self.buyprice = order.executed.price
             self.buycomm = order.executed.comm
         elif order.status in [order.Canceled, order.Margin, order.Rejected]:
-            self.log('订单取消/拒绝/保证金不足')
+            self.log(f'订单取消/拒绝/保证金不足: cash={self.broker.getcash():.2f}, value={self.broker.getvalue():.2f}')
         self.order = None
 
     def notify_trade(self, trade):
@@ -540,8 +563,13 @@ def my_strage():
     # 获取当前运行脚本所在目录  
     modpath = os.path.dirname(os.path.abspath(sys.argv[0]))
 
-    # 用pandas读取CSV数据
-    df = pd.read_csv(os.path.join(modpath, '../BTC-USD_1H_20251111_221506.csv'), parse_dates=['datetime'])
+    # 用配置读取CSV数据（切换数据源只改 ACTIVE_DATA_SOURCE）
+    data_file = DATA_SOURCES.get(ACTIVE_DATA_SOURCE)
+    if not data_file:
+        raise ValueError(f"无效的数据源键: {ACTIVE_DATA_SOURCE}，可选: {list(DATA_SOURCES.keys())}")
+    data_path = os.path.join(modpath, "..", data_file)
+    df = pd.read_csv(data_path, parse_dates=['datetime'])
+    print(f"当前数据源: {ACTIVE_DATA_SOURCE} -> {data_file}")
     print("数据长度：", len(df))  # df 是你的 DataFrame
     df.set_index('datetime', inplace=True)
     df.sort_index(inplace=True)
