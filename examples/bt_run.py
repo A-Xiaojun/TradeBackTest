@@ -37,6 +37,7 @@ class RightSidePivotStrategy(bt.Strategy):
         self.buyprice = None
         self.buycomm = None
         self.stop_price = None
+        self.initial_equity = None  # 记录期初资金，用于固定仓位
 
         # 记录资金曲线、买卖点和仓位以便绘图
         self.trade_markers = {'buy': [], 'sell': []}
@@ -68,6 +69,9 @@ class RightSidePivotStrategy(bt.Strategy):
         self.bb = bt.indicators.BollingerBands(self.datas[0], period=self.p.bb_period, devfactor=self.p.bb_dev)
 
     def next(self):
+        if self.initial_equity is None:
+            self.initial_equity = float(self.broker.getvalue())
+
         # 记录每根K线结束后的资金和仓位情况
         self.equity_curve.append(self.broker.getvalue())
         self.position_curve.append(self.position.size)
@@ -142,8 +146,8 @@ class RightSidePivotStrategy(bt.Strategy):
                 # 判断最近两个低点是否抬高
                 swing_ok = (self.lows[-1] - self.lows[-2]) >= self.p.min_swing_atr_mult * max(self.atr[0], 1e-9)
                 if self.lows[-1] > self.lows[-2] and swing_ok:
-                    # 资金管理：计算10%资金能买多少股，并加上杠杆
-                    target_value = self.broker.getvalue() * self.p.risk_percent * self.p.leverage
+                    # 资金管理：固定按“期初资金的10%”计算每笔仓位，再乘杠杆
+                    target_value = self.initial_equity * self.p.risk_percent * self.p.leverage
                     size = target_value / close
                     self.order = self.buy(size=size)
                     self.stop_price = self.lows[-1] # 止损设在最近的低点拐点
@@ -154,7 +158,7 @@ class RightSidePivotStrategy(bt.Strategy):
                 # 判断最近两个高点是否降低
                 swing_ok = (self.highs[-2] - self.highs[-1]) >= self.p.min_swing_atr_mult * max(self.atr[0], 1e-9)
                 if self.highs[-1] < self.highs[-2] and swing_ok:
-                    target_value = self.broker.getvalue() * self.p.risk_percent * self.p.leverage
+                    target_value = self.initial_equity * self.p.risk_percent * self.p.leverage
                     size = target_value / close
                     self.order = self.sell(size=size)
                     self.stop_price = self.highs[-1] # 止损设在最近的高点拐点
