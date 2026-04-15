@@ -19,6 +19,7 @@ DATA_SOURCES = {
 }
 ACTIVE_DATA_SOURCE = "eth_15m_new"  # 在这里切换数据源键
 DATA_SOURCE_SUBDIR = os.path.join("output", "kline")
+BACKTEST_INITIAL_CASH = 750.0  # 初始资金（USDT）
 
 class RightSidePivotStrategy(bt.Strategy):
     """
@@ -30,11 +31,13 @@ class RightSidePivotStrategy(bt.Strategy):
     """
     params = (
         ('pivot_period', 5),  # 寻找局部高低点的窗口期（左右各看几根K线）
-        ('risk_percent', 0.10), # 每次开仓使用资金比例 (10%)
+        ('risk_percent', 1.00), # 每次开仓使用资金比例 (100%，即全仓)
         ('leverage', 10.0),   # 新增：杠杆倍数，默认 10x
-        ('order_utilization', 0.95),  # 可用保证金利用率，预留手续费缓冲避免拒单
+        ('order_utilization', 1.00),  # 可用保证金利用率（全仓）
         ('auto_topup_to_initial', True),  # 当前资金低于期初时，自动补到期初
         ('auto_withdraw_profit', True),   # 当前资金高于期初时，自动取出利润
+        ('max_external_topup', 2600.0),   # 后备资金上限（总额，USDT）
+        ('profit_pool_floor', 50.0),      # 盈利池保底余额（尽量不补到0）
         ('atr_period', 14),
         ('adx_period', 14),
         ('adx_threshold', 18.0),
@@ -57,6 +60,8 @@ class RightSidePivotStrategy(bt.Strategy):
         self.cum_withdraw = 0.0          # 累计取出
         self.cum_topup_external = 0.0    # 累计外部补资
         self.profit_pool = 0.0           # 盈利池（从账户取出的利润，可回补）
+        self.funding_exhausted = False   # 后备资金耗尽后，不再新开仓
+        self.funding_exhausted_notified = False
 
         # 记录资金曲线、买卖点和仓位以便绘图
         self.trade_markers = {'buy': [], 'sell': []}
@@ -91,6 +96,26 @@ class RightSidePivotStrategy(bt.Strategy):
         self.adx = bt.indicators.AverageDirectionalMovementIndex(self.datas[0], period=self.p.adx_period)
         self.bb = bt.indicators.BollingerBands(self.datas[0], period=self.p.bb_period, devfactor=self.p.bb_dev)
 
+    def get_real_monthly_returns(self):
+        """按真实权益口径统计月度收益率（与真实累计盈亏口径一致）。"""
+        if not self.dt_records or not self.real_pnl_curve:
+            return {}
+        # 真实权益 = 真实累计盈亏 + 初始本金
+        real_equity = np.asarray(self.real_pnl_curve, dtype=float) + float(self.initial_equity)
+        idx = pd.DatetimeIndex(self.dt_records)
+        s = pd.Series(real_equity, index=idx).sort_index()
+        # 每月取该月最后一个时点的真实权益
+        month_end_equity = s.groupby(s.index.to_period('M')).last()
+
+        out = {}
+        prev = float(self.initial_equity)
+        for p, v in month_end_equity.items():
+            cur = float(v)
+            ret = (cur / prev - 1.0) if prev > 0 else np.nan
+            out[str(p)] = ret
+            prev = cur
+        return out
+
     def _calc_order_size(self, close: float) -> float:
         """按期初资金目标下单，并受当前可用保证金约束，尽量避免保证金拒单。"""
         if close <= 0:
@@ -123,15 +148,36 @@ class RightSidePivotStrategy(bt.Strategy):
         # 情况2：亏损补资（先用盈利池，不足部分记外部补资）
         if self.p.auto_topup_to_initial and current_value < self.initial_equity - eps:
             deficit = self.initial_equity - current_value
-            from_pool = min(deficit, self.profit_pool)
-            external = deficit - from_pool
+            pool_usable = max(self.profit_pool - self.p.profit_pool_floor, 0.0)
+            from_pool = min(deficit, pool_usable)
+            remain = deficit - from_pool
+            external_left = max(self.p.max_external_topup - self.cum_topup_external, 0.0)
+            external = min(remain, external_left) if remain > eps else 0.0
+            topup = from_pool + external
+            if topup <= eps:
+                self.funding_exhausted = True
+                if not self.funding_exhausted_notified:
+                    self.log(f"补资失败: 盈利池与后备资金均耗尽(后备上限={self.p.max_external_topup:.2f})，停止新开仓")
+                    self.funding_exhausted_notified = True
+                return
             if hasattr(self.broker, "add_cash"):
-                self.broker.add_cash(deficit)
+                self.broker.add_cash(topup)
             else:
-                self.broker.setcash(float(self.broker.getcash()) + deficit)
+                self.broker.setcash(float(self.broker.getcash()) + topup)
             self.profit_pool -= from_pool
             self.cum_topup_external += external
-            self.log(f"亏损补资: {deficit:.2f} (盈利池={from_pool:.2f}, 外部={external:.2f}), 盈利池={self.profit_pool:.2f}")
+            self.log(f"亏损补资: {topup:.2f} (盈利池={from_pool:.2f}, 外部={external:.2f}), 盈利池={self.profit_pool:.2f}, 外部累计={self.cum_topup_external:.2f}")
+            if topup + eps < deficit:
+                self.funding_exhausted = True
+                if not self.funding_exhausted_notified:
+                    self.log(f"后备资金已达上限 {self.p.max_external_topup:.2f}，仍缺口={deficit-topup:.2f}，停止新开仓")
+                    self.funding_exhausted_notified = True
+
+    def _can_continue_trading_when_funding_exhausted(self) -> bool:
+        """资金耗尽后，若真实累计盈亏为正或后备资金仍有余额，则允许继续交易。"""
+        external_left = self.p.max_external_topup - self.cum_topup_external
+        current_real_pnl = float(self.broker.getvalue()) + self.cum_withdraw - self.cum_topup_external - float(self.initial_equity or 0.0)
+        return (external_left > 1e-9) or (current_real_pnl > 0.0)
 
     def next(self):
         if self.initial_equity is None:
@@ -163,6 +209,10 @@ class RightSidePivotStrategy(bt.Strategy):
         
         if self.order:
             return  # 有挂单则不处理
+        if (not self.position) and self.funding_exhausted:
+            if not self._can_continue_trading_when_funding_exhausted():
+                return  # 资金补充能力已耗尽，且无继续交易条件
+            # 满足继续交易条件时，允许继续开仓（不重置告警状态，避免重复刷屏）
 
         # 寻找分形高低点 (Fractal Pivots)
         # 判断当前K线往前推 pivot_period 根K线，是否是局部最高或最低
@@ -669,15 +719,15 @@ def my_strage():
         todate=end_dt.to_pydatetime()
     )
     cerebro.adddata(data)
-    # 设置投资金额100000.0 
-    cerebro.broker.setcash(1000000.0) 
+    # 设置初始资金（USDT）
+    cerebro.broker.setcash(BACKTEST_INITIAL_CASH)
     
     # 因为加了 10x 杠杆，需要确保券商允许使用保证金(margin)交易，避免现金不足被拒绝
     comminfo = CryptoCommissionInfo()
     cerebro.broker.addcommissioninfo(comminfo)
     cerebro.broker.set_checksubmit(False) # 允许不检查现金是否足够（模拟杠杆借贷）
     
-    # 新增：添加收益率分析器
+    # 收益率分析器：整体
     cerebro.addanalyzer(bt.analyzers.TimeReturn, _name='timereturn')
     
     # 引擎运行前打印期出资金  
@@ -690,8 +740,15 @@ def my_strage():
     if strat.real_pnl_curve:
         print('累计取出: %.2f' % strat.cum_withdraw)
         print('累计外部补资: %.2f' % strat.cum_topup_external)
+        print('后备资金上限: %.2f' % strat.p.max_external_topup)
+        print('后备资金是否耗尽: %s' % ('是' if strat.funding_exhausted else '否'))
         print('盈利池余额: %.2f' % strat.profit_pool)
         print('真实累计盈亏: %.2f' % strat.real_pnl_curve[-1])
+    monthly = strat.get_real_monthly_returns()
+    if monthly:
+        print('月度收益率(真实口径, %)：')
+        for k, v in sorted(monthly.items(), key=lambda x: x[0]):
+            print(f'  {k}: {v*100:.2f}%')
     
     # 调用绘图函数
     plot_results(df_plot, strat, initial_cash=initial_cash)
