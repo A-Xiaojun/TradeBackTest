@@ -1,5 +1,9 @@
 {
   "apiKey": "your api key",
   "secret": "your secret",
-  "password": "your password"
+  "password": "your password",
+  "flag": "1",
+  "start_time": "",
+  "bar": "15m",
+  "symbol": "ETH-USDT-SWAP"
 }

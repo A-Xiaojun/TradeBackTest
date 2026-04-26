@@ -1,0 +1,19 @@
+{
+  "stop_price": null,
+  "last_exit_dt": null,
+  "initial_equity": 93363.51,
+  "initial_funding_balance": 67.79916606,
+  "cum_withdraw": 88.07844732000001,
+  "cum_topup_external": 5.069995075580664,
+  "profit_pool": 88.07844732000001,
+  "funding_exhausted": false,
+  "funding_exhausted_notified": false,
+  "last_known_trading_balance": {
+    "total_eq": 93363.07288066756,
+    "available_eq": 4893.21423782
+  },
+  "last_known_funding_balance": {
+    "balance": 106.78576218,
+    "available": 106.78576218
+  }
+}
