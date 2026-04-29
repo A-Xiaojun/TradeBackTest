@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from datetime import timezone, timedelta
 
 import certifi
 import ccxt
@@ -24,7 +25,8 @@ POLL_SECONDS = 10
 HISTORY_LIMIT = 200
 HISTORY_PAGE_LIMIT = 100
 MAX_HISTORY_BACKFILL_PAGES = 300
-TD_MODE = "cross"
+REST_TIMEOUT_MS = 20000
+TD_MODE = "isolated"
 POS_MODE = "long_short_mode"
 SIMULATED_FLAG = "1"  # "1" for paper trading, "0" for live
 CONFIG_BASENAME = "config"
@@ -38,9 +40,9 @@ PIVOT_PERIOD = 5
 RISK_PERCENT = 1.00
 LEVERAGE = 10.0
 ORDER_UTILIZATION = 1.00
-AUTO_TOPUP_TO_INITIAL = True
-AUTO_WITHDRAW_PROFIT = True
-MAX_EXTERNAL_TOPUP = 2600.0
+AUTO_TOPUP_TO_INITIAL = False
+AUTO_WITHDRAW_PROFIT = False
+MAX_EXTERNAL_TOPUP = 750.0
 PROFIT_POOL_FLOOR = 50.0
 MIN_CASHFLOW_TRANSFER = 5.0
 STARTUP_RETRY_ATTEMPTS = 5
@@ -52,6 +54,10 @@ WS_QUEUE_TIMEOUT_SECONDS = 5
 WS_RECONNECT_DELAY_SECONDS = 5
 WS_SUBSCRIBE_TIMEOUT_SECONDS = 8
 WS_HEARTBEAT_SECONDS = 20
+CLOSED_BAR_POLL_INTERVAL_SECONDS = 8
+WARMUP_CACHE_TAIL_BARS = 120
+WARMUP_CACHE_VALIDATION_BARS = 20
+WARMUP_CACHE_MAX_GAP_BARS = 32
 ATR_PERIOD = 14
 ADX_PERIOD = 14
 ADX_THRESHOLD = 18.0
@@ -63,6 +69,8 @@ MIN_EMA_SPREAD_PCT = 0.003
 COOLDOWN_BARS = 2
 EMA_FAST = 10
 EMA_SLOW = 20
+LOG_TZ = timezone(timedelta(hours=8))
+LOG_TZ_NAME = "UTC+8"
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -120,6 +128,26 @@ def _normalize_start_time(value: str) -> Optional[pd.Timestamp]:
     if ts.tzinfo is not None:
         return ts.tz_convert("UTC").tz_localize(None)
     return ts
+
+
+def _format_log_dt(value: Optional[pd.Timestamp]) -> str:
+    if value is None:
+        return "None"
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+    return f"{ts.tz_convert(LOG_TZ).strftime('%Y-%m-%d %H:%M:%S')} {LOG_TZ_NAME}"
+
+
+def _daily_pnl_key(value: pd.Timestamp) -> str:
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+    return ts.tz_convert(LOG_TZ).strftime("%Y-%m-%d")
 
 
 def _is_retryable_network_error(exc: Exception) -> bool:
@@ -204,6 +232,8 @@ class OkxCandleStream:
         self.queue: "queue.Queue[Dict[str, float]]" = queue.Queue(maxsize=1024)
         self.stop_event = threading.Event()
         self.thread: Optional[threading.Thread] = None
+        self.pending_candle: Optional[Dict[str, float]] = None
+        self.last_live_log_dt: Optional[pd.Timestamp] = None
 
     def start(self) -> None:
         if self.thread and self.thread.is_alive():
@@ -303,18 +333,60 @@ class OkxCandleStream:
             return False
         rows = payload.get("data") or []
         for row in rows:
-            candle = OkxPaperTrader.parse_candle_row(row)
+            candle = OkxPaperTrader.parse_ws_candle_row(row)
             if candle is None:
                 continue
-            try:
-                self.queue.put_nowait(candle)
-            except queue.Full:
-                try:
-                    self.queue.get_nowait()
-                except queue.Empty:
-                    pass
-                self.queue.put_nowait(candle)
+            confirmed = str(row[8]) == "1"
+            self._maybe_log_live_candle(candle, confirmed)
+            self._handle_ws_candle(candle, confirmed)
         return False
+
+    def _handle_ws_candle(self, candle: Dict[str, float], confirmed: bool) -> None:
+        # Some OKX sessions only push the rolling bar with confirm=0. To keep
+        # New bar processing stable, we treat a timestamp rollover as the signal
+        # that the previous cached bar has finished.
+        if self.pending_candle is None:
+            if confirmed:
+                self._enqueue_candle(candle)
+            else:
+                self.pending_candle = candle
+            return
+
+        pending_dt = pd.Timestamp(self.pending_candle["datetime"])
+        current_dt = pd.Timestamp(candle["datetime"])
+
+        if current_dt > pending_dt:
+            self._enqueue_candle(self.pending_candle)
+            self.pending_candle = None if confirmed else candle
+            if confirmed:
+                self._enqueue_candle(candle)
+            return
+
+        if current_dt == pending_dt:
+            self.pending_candle = candle
+            if confirmed:
+                self._enqueue_candle(candle)
+                self.pending_candle = None
+
+    def _enqueue_candle(self, candle: Dict[str, float]) -> None:
+        try:
+            self.queue.put_nowait(candle)
+        except queue.Full:
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                pass
+            self.queue.put_nowait(candle)
+
+    def _maybe_log_live_candle(self, candle: Dict[str, float], confirmed: bool) -> None:
+        dt = pd.Timestamp(candle["datetime"])
+        if self.last_live_log_dt is not None and dt <= self.last_live_log_dt:
+            return
+        self.last_live_log_dt = dt
+        self.logger(
+            f"Live bar: dt={_format_log_dt(dt)}, close={float(candle['close']):.2f}, "
+            f"high={float(candle['high']):.2f}, low={float(candle['low']):.2f}, confirmed={int(confirmed)}"
+        )
 
 
 class OkxPaperTrader:
@@ -345,6 +417,7 @@ class OkxPaperTrader:
                 "secret": self.config["secret"],
                 "password": self.config["password"],
                 "enableRateLimit": True,
+                "timeout": REST_TIMEOUT_MS,
                 "options": {"defaultType": "swap"},
             }
         )
@@ -365,8 +438,11 @@ class OkxPaperTrader:
         self.position = Position()
         self.market_df = pd.DataFrame()
         self.stop_price: Optional[float] = None
+        self.last_position_sync_signature: Optional[tuple] = None
         self.last_exit_dt: Optional[pd.Timestamp] = None
         self.last_processed_dt: Optional[pd.Timestamp] = None
+        self.last_closed_bar_poll_ts = 0.0
+        self.cached_warmup_payload: Dict[str, Any] = {}
         self.initial_equity: Optional[float] = None
         self.initial_funding_balance: Optional[float] = None
         self.cum_withdraw = 0.0
@@ -376,6 +452,7 @@ class OkxPaperTrader:
         self.funding_exhausted_notified = False
         self.last_known_trading_balance = {"total_eq": INITIAL_CASH, "available_eq": INITIAL_CASH}
         self.last_known_funding_balance = {"balance": 0.0, "available": 0.0}
+        self.daily_pnl_stats: Dict[str, Dict[str, float]] = {}
         self.candle_stream = OkxCandleStream(
             self.inst_id,
             self.bar,
@@ -423,6 +500,63 @@ class OkxPaperTrader:
             f"cum_external_topup={self.cum_topup_external:.2f}"
         )
 
+    def _normalize_daily_pnl_stats(self, raw: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
+        stats: Dict[str, Dict[str, float]] = {}
+        for day, values in (raw or {}).items():
+            if not isinstance(values, dict):
+                continue
+            stats[str(day)] = {
+                "realized_pnl": _safe_float(values.get("realized_pnl"), 0.0),
+                "fees": _safe_float(values.get("fees"), 0.0),
+                "opens": _safe_float(values.get("opens"), 0.0),
+                "closes": _safe_float(values.get("closes"), 0.0),
+            }
+        return stats
+
+    def _record_daily_pnl(
+        self,
+        dt: pd.Timestamp,
+        *,
+        realized_pnl_delta: float = 0.0,
+        fee_delta: float = 0.0,
+        opens_delta: float = 0.0,
+        closes_delta: float = 0.0,
+    ) -> None:
+        day = _daily_pnl_key(dt)
+        bucket = self.daily_pnl_stats.setdefault(
+            day,
+            {"realized_pnl": 0.0, "fees": 0.0, "opens": 0.0, "closes": 0.0},
+        )
+        bucket["realized_pnl"] += float(realized_pnl_delta)
+        bucket["fees"] += abs(float(fee_delta))
+        bucket["opens"] += float(opens_delta)
+        bucket["closes"] += float(closes_delta)
+
+    def _log_daily_pnl_summary(self, current_dt: Optional[pd.Timestamp] = None, recent_days: int = 7) -> None:
+        now = current_dt if current_dt is not None else pd.Timestamp.utcnow()
+        today_key = _daily_pnl_key(pd.Timestamp(now))
+        today = self.daily_pnl_stats.get(
+            today_key,
+            {"realized_pnl": 0.0, "fees": 0.0, "opens": 0.0, "closes": 0.0},
+        )
+        today_net = today["realized_pnl"] - today["fees"]
+        self._log(
+            f"Daily PnL today: day={today_key}, net={today_net:.4f}, realized={today['realized_pnl']:.4f}, "
+            f"fees={today['fees']:.4f}, opens={int(today['opens'])}, closes={int(today['closes'])}"
+        )
+        recent_keys = sorted(self.daily_pnl_stats.keys(), reverse=True)[:recent_days]
+        if not recent_keys:
+            return
+        parts = []
+        for day in recent_keys:
+            stats = self.daily_pnl_stats[day]
+            net = stats["realized_pnl"] - stats["fees"]
+            parts.append(
+                f"{day}: net={net:.4f}, realized={stats['realized_pnl']:.4f}, "
+                f"fees={stats['fees']:.4f}, opens={int(stats['opens'])}, closes={int(stats['closes'])}"
+            )
+        self._log("Recent daily PnL: " + " | ".join(parts))
+
     def _should_sync_position(self, loop_count: int, has_new_rows: bool) -> bool:
         if has_new_rows:
             return True
@@ -435,6 +569,12 @@ class OkxPaperTrader:
         if len(row) < 9:
             return None
         if str(row[8]) != "1":
+            return None
+        return OkxPaperTrader.parse_ws_candle_row(row)
+
+    @staticmethod
+    def parse_ws_candle_row(row: List[str]) -> Optional[Dict[str, float]]:
+        if len(row) < 6:
             return None
         return {
             "datetime": pd.to_datetime(int(row[0]), unit="ms"),
@@ -465,8 +605,7 @@ class OkxPaperTrader:
         if close <= 0:
             return {"contracts": 0.0, "base_size": 0.0, "target_notional": 0.0, "max_notional_now": 0.0}
         if self.initial_equity is None:
-            snapshot = self._fetch_balance_snapshot()
-            self.initial_equity = snapshot["total_eq"] if snapshot["total_eq"] > 0 else INITIAL_CASH
+            self.initial_equity = INITIAL_CASH
         snapshot = self._fetch_balance_snapshot()
         # 对应 bt_run.py 里的 _calc_order_size()：
         # 目标仓位先按“期初资金 * 风险比例 * 杠杆”计算，再受当前可用保证金约束。
@@ -523,13 +662,15 @@ class OkxPaperTrader:
         self.stop_price = float(stop_price) if stop_price is not None else None
         last_exit = data.get("last_exit_dt")
         self.last_exit_dt = pd.Timestamp(last_exit) if last_exit else None
-        self.initial_equity = _safe_float(data.get("initial_equity"), 0.0) or None
+        # Trading capital anchor is fixed at INITIAL_CASH; ignore historical larger values.
+        self.initial_equity = INITIAL_CASH
         self.initial_funding_balance = _safe_float(data.get("initial_funding_balance"), 0.0) or None
         self.cum_withdraw = _safe_float(data.get("cum_withdraw"), 0.0)
         self.cum_topup_external = _safe_float(data.get("cum_topup_external"), 0.0)
         self.profit_pool = _safe_float(data.get("profit_pool"), 0.0)
-        self.funding_exhausted = bool(data.get("funding_exhausted", False))
-        self.funding_exhausted_notified = bool(data.get("funding_exhausted_notified", False))
+        # Cash transfer policies are disabled in demo mode; avoid stale funding flags blocking trading.
+        self.funding_exhausted = False
+        self.funding_exhausted_notified = False
         self.last_known_trading_balance = {
             "total_eq": _safe_float(data.get("last_known_trading_balance", {}).get("total_eq"), INITIAL_CASH),
             "available_eq": _safe_float(data.get("last_known_trading_balance", {}).get("available_eq"), INITIAL_CASH),
@@ -538,8 +679,11 @@ class OkxPaperTrader:
             "balance": _safe_float(data.get("last_known_funding_balance", {}).get("balance"), 0.0),
             "available": _safe_float(data.get("last_known_funding_balance", {}).get("available"), 0.0),
         }
+        self.daily_pnl_stats = self._normalize_daily_pnl_stats(data.get("daily_pnl_stats", {}))
+        self.cached_warmup_payload = data.get("warmup_cache", {}) or {}
 
     def _save_state(self) -> None:
+        warmup_cache = self._build_warmup_cache_payload()
         payload = {
             "stop_price": self.stop_price,
             "last_exit_dt": self.last_exit_dt.isoformat() if self.last_exit_dt is not None else None,
@@ -552,8 +696,57 @@ class OkxPaperTrader:
             "funding_exhausted_notified": self.funding_exhausted_notified,
             "last_known_trading_balance": self.last_known_trading_balance,
             "last_known_funding_balance": self.last_known_funding_balance,
+            "daily_pnl_stats": self.daily_pnl_stats,
+            "warmup_cache": warmup_cache,
         }
         self.state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    def _build_strategy_signature(self) -> Dict[str, Any]:
+        return {
+            "inst_id": self.inst_id,
+            "bar": self.bar,
+            "start_time": self.start_time.isoformat() if self.start_time is not None else None,
+            "pivot_period": PIVOT_PERIOD,
+            "atr_period": ATR_PERIOD,
+            "adx_period": ADX_PERIOD,
+            "adx_threshold": ADX_THRESHOLD,
+            "bb_period": BB_PERIOD,
+            "bb_dev": BB_DEV,
+            "bb_bandwidth_threshold": BB_BANDWIDTH_THRESHOLD,
+            "min_swing_atr_mult": MIN_SWING_ATR_MULT,
+            "min_ema_spread_pct": MIN_EMA_SPREAD_PCT,
+            "cooldown_bars": COOLDOWN_BARS,
+            "ema_fast": EMA_FAST,
+            "ema_slow": EMA_SLOW,
+            "warmup_bars": _indicator_warmup_bars(),
+        }
+
+    def _build_warmup_cache_payload(self) -> Dict[str, Any]:
+        if self.market_df.empty or self.last_processed_dt is None:
+            return {}
+        raw_cols = ["datetime", "open", "high", "low", "close", "volume"]
+        available_cols = [col for col in raw_cols if col in self.market_df.columns]
+        if len(available_cols) != len(raw_cols):
+            return {}
+        recent_df = self.market_df[raw_cols].tail(WARMUP_CACHE_TAIL_BARS).copy()
+        candles = []
+        for row in recent_df.to_dict(orient="records"):
+            candles.append(
+                {
+                    "datetime": pd.Timestamp(row["datetime"]).isoformat(),
+                    "open": float(row["open"]),
+                    "high": float(row["high"]),
+                    "low": float(row["low"]),
+                    "close": float(row["close"]),
+                    "volume": float(row["volume"]),
+                }
+            )
+        return {
+            "signature": self._build_strategy_signature(),
+            "saved_at": pd.Timestamp.utcnow().isoformat(),
+            "last_processed_dt": self.last_processed_dt.isoformat(),
+            "candles": candles,
+        }
 
     def _load_instrument_meta(self) -> None:
         response = self.exchange.public_get_public_instruments({"instType": "SWAP", "instId": self.inst_id})
@@ -676,75 +869,12 @@ class OkxPaperTrader:
         return amount
 
     def _apply_cashflow_policy(self) -> None:
-        if self.initial_equity is None:
-            return
-        trading = self._fetch_balance_snapshot()
-        funding = self._fetch_funding_balance()
-        current_value = trading["total_eq"]
-        funding_avail = funding["available"]
-        eps = 1e-9
+        # Demo environment uses fixed isolated sizing without internal cash transfers.
+        self.funding_exhausted = False
+        self.funding_exhausted_notified = False
 
-        if AUTO_WITHDRAW_PROFIT and current_value > self.initial_equity + eps:
-            amount = current_value - self.initial_equity
-            if amount < MIN_CASHFLOW_TRANSFER:
-                return
-            transferred = min(amount, trading["available_eq"])
-            transferred = self._transfer_between_accounts(
-                transferred,
-                from_account=TRADING_ACCOUNT,
-                to_account=FUNDING_ACCOUNT,
-                reason="profit_withdraw",
-            )
-            if transferred > eps:
-                self.cum_withdraw += transferred
-                self.profit_pool += transferred
-                self.funding_exhausted = False
-                self.funding_exhausted_notified = False
-                self._save_state()
-                self._log_account_snapshot("After transfer")
-            return
-
-        if AUTO_TOPUP_TO_INITIAL and current_value < self.initial_equity - eps:
-            deficit = self.initial_equity - current_value
-            if deficit < MIN_CASHFLOW_TRANSFER:
-                return
-            pool_usable = max(self.profit_pool - PROFIT_POOL_FLOOR, 0.0)
-            from_pool = min(deficit, pool_usable, funding_avail)
-            remain = deficit - from_pool
-            funding_left_after_pool = max(funding_avail - from_pool, 0.0)
-            external_left = max(MAX_EXTERNAL_TOPUP - self.cum_topup_external, 0.0)
-            external = min(remain, external_left, funding_left_after_pool)
-            topup = from_pool + external
-            if topup <= eps or topup < MIN_CASHFLOW_TRANSFER:
-                self.funding_exhausted = True
-                if not self.funding_exhausted_notified:
-                    self._log(
-                        f"Topup skipped: funding balance unavailable or external limit reached "
-                        f"(max_external_topup={MAX_EXTERNAL_TOPUP:.2f})"
-                    )
-                    self.funding_exhausted_notified = True
-                    self._save_state()
-                return
-            transferred = self._transfer_between_accounts(
-                topup,
-                from_account=FUNDING_ACCOUNT,
-                to_account=TRADING_ACCOUNT,
-                reason="loss_topup",
-            )
-            if transferred > eps:
-                used_from_pool = min(from_pool, transferred)
-                used_external = min(external, max(transferred - used_from_pool, 0.0))
-                self.profit_pool -= used_from_pool
-                self.cum_topup_external += used_external
-                self.funding_exhausted = transferred + eps < deficit
-                if self.funding_exhausted and not self.funding_exhausted_notified:
-                    self._log(
-                        f"Funding partially exhausted: deficit={deficit:.2f}, transferred={transferred:.2f}, "
-                        f"external_used={self.cum_topup_external:.2f}"
-                    )
-                    self.funding_exhausted_notified = True
-                self._save_state()
-                self._log_account_snapshot("After transfer")
+    def _rebalance_trading_excess_to_target(self) -> None:
+        return
 
     def _can_continue_trading_when_funding_exhausted(self) -> bool:
         if self.initial_equity is None:
@@ -783,10 +913,19 @@ class OkxPaperTrader:
         self.position = active[0] if active else Position()
         if self.position.side == 0:
             self.stop_price = None
-        self._log(
-            f"Position sync: side={self.position.side}, contracts={self.position.contracts}, "
-            f"avg_price={self.position.avg_price}, stop={self.stop_price}"
+        signature = (
+            self.position.side,
+            round(self.position.contracts, 12),
+            round(self.position.avg_price, 8),
+            self.position.pos_side,
+            None if self.stop_price is None else round(self.stop_price, 8),
         )
+        if signature != self.last_position_sync_signature:
+            self.last_position_sync_signature = signature
+            self._log(
+                f"Position sync: side={self.position.side}, contracts={self.position.contracts}, "
+                f"avg_price={self.position.avg_price}, stop={self.stop_price}"
+            )
 
     def _parse_candle_rows(self, rows: List[List[str]]) -> pd.DataFrame:
         parsed = []
@@ -812,14 +951,17 @@ class OkxPaperTrader:
         last_error: Optional[Exception] = None
         for attempt in range(1, 4):
             try:
+                params = {"instId": self.inst_id, "bar": self.bar, "limit": str(limit)}
+                if after:
+                    params["after"] = after
+                if before:
+                    params["before"] = before
                 return self._ok(
-                    self.market.public_get_market_history_candles(
-                        {"instId": self.inst_id, "bar": self.bar, "limit": str(limit), "after": after, "before": before}
-                    )
+                    self.market.public_get_market_history_candles(params)
                 )
             except Exception as exc:
                 last_error = exc
-                self._log(f"Candle fetch failed ({attempt}/3): {exc}")
+                self._log(f"Candle fetch failed ({attempt}/3): {type(exc).__name__}: {exc}")
                 if attempt < 3:
                     time.sleep(1.5 * attempt)
         raise RuntimeError(f"Failed to fetch candle page after retries: {last_error}")
@@ -879,6 +1021,38 @@ class OkxPaperTrader:
             )
         return df
 
+    def _fetch_latest_closed_candle(self) -> Optional[Dict[str, float]]:
+        candles = self._fetch_latest_closed_candles(limit=3)
+        if not candles:
+            return None
+        return candles[-1]
+
+    def _fetch_latest_closed_candles(self, limit: int) -> List[Dict[str, float]]:
+        rows = self._fetch_candle_page(limit=limit)
+        candles = []
+        for row in rows:
+            candle = self.parse_candle_row(row)
+            if candle is not None:
+                candles.append(candle)
+        candles.sort(key=lambda item: pd.Timestamp(item["datetime"]))
+        return candles
+
+    def _maybe_poll_latest_closed_candle(self) -> Optional[Dict[str, float]]:
+        now = time.time()
+        if now - self.last_closed_bar_poll_ts < CLOSED_BAR_POLL_INTERVAL_SECONDS:
+            return None
+        self.last_closed_bar_poll_ts = now
+        candle = self._fetch_latest_closed_candle()
+        if candle is None:
+            return None
+        candle_dt = pd.Timestamp(candle["datetime"])
+        if self.last_processed_dt is not None and candle_dt <= self.last_processed_dt:
+            return None
+        self._log(
+            f"REST closed bar fallback: dt={_format_log_dt(candle_dt)}, close={float(candle['close']):.2f}"
+        )
+        return candle
+
     def _update_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         out = df.copy()
         # 对应 bt_run.py 里 __init__ 的指标定义：
@@ -892,6 +1066,129 @@ class OkxPaperTrader:
         out["bb_top"] = mid + BB_DEV * std
         out["bb_bot"] = mid - BB_DEV * std
         return out
+
+    def _bar_gap_count(self, earlier: pd.Timestamp, later: pd.Timestamp) -> int:
+        delta_seconds = max((later - earlier).total_seconds(), 0.0)
+        return int(round(delta_seconds / _bar_seconds(self.bar)))
+
+    def _rebuild_pivots_from_market_df(self) -> None:
+        self.highs = []
+        self.lows = []
+        if self.market_df.empty:
+            return
+        for idx in range(len(self.market_df)):
+            self._detect_pivot(self.market_df, idx)
+
+    def _candles_from_cache_payload(self, payload: Dict[str, Any]) -> Optional[pd.DataFrame]:
+        rows = payload.get("candles")
+        if not isinstance(rows, list) or not rows:
+            return None
+        parsed = []
+        for row in rows:
+            try:
+                parsed.append(
+                    {
+                        "datetime": pd.Timestamp(row["datetime"]),
+                        "open": float(row["open"]),
+                        "high": float(row["high"]),
+                        "low": float(row["low"]),
+                        "close": float(row["close"]),
+                        "volume": float(row.get("volume", 0.0)),
+                    }
+                )
+            except Exception:
+                return None
+        df = pd.DataFrame(parsed)
+        if df.empty:
+            return None
+        df = df.drop_duplicates(subset=["datetime"]).sort_values("datetime").reset_index(drop=True)
+        if len(df) < _indicator_warmup_bars():
+            return None
+        return df
+
+    def _validate_warmup_cache(self) -> Optional[Dict[str, Any]]:
+        payload = self.cached_warmup_payload
+        if not payload:
+            self._log("Warmup cache miss: no cached payload.")
+            return None
+        if payload.get("signature") != self._build_strategy_signature():
+            self._log("Warmup cache invalid: strategy signature changed.")
+            return None
+        df = self._candles_from_cache_payload(payload)
+        if df is None:
+            self._log("Warmup cache invalid: cached candles incomplete.")
+            return None
+        cached_last_dt = pd.Timestamp(payload.get("last_processed_dt")) if payload.get("last_processed_dt") else None
+        if cached_last_dt is None or pd.Timestamp(df.iloc[-1]["datetime"]) != cached_last_dt:
+            self._log("Warmup cache invalid: last_processed_dt mismatch.")
+            return None
+        latest_exchange = self._fetch_latest_closed_candles(limit=WARMUP_CACHE_VALIDATION_BARS)
+        if not latest_exchange:
+            self._log("Warmup cache validation skipped: no latest closed candles fetched.")
+            return None
+        latest_exchange_dt = pd.Timestamp(latest_exchange[-1]["datetime"])
+        if latest_exchange_dt < cached_last_dt:
+            self._log("Warmup cache invalid: cached timestamp is ahead of exchange data.")
+            return None
+        gap_bars = self._bar_gap_count(cached_last_dt, latest_exchange_dt)
+        if gap_bars > WARMUP_CACHE_MAX_GAP_BARS:
+            self._log(
+                f"Warmup cache invalid: gap too large ({gap_bars} bars > {WARMUP_CACHE_MAX_GAP_BARS})."
+            )
+            return None
+        exchange_by_dt = {pd.Timestamp(item["datetime"]): item for item in latest_exchange}
+        overlap_rows = []
+        for _, row in df.tail(WARMUP_CACHE_VALIDATION_BARS).iterrows():
+            dt = pd.Timestamp(row["datetime"])
+            remote = exchange_by_dt.get(dt)
+            if remote is None:
+                continue
+            overlap_rows.append((row, remote))
+        if not overlap_rows:
+            self._log("Warmup cache invalid: no overlap with latest exchange candles.")
+            return None
+        for local_row, remote_row in overlap_rows:
+            for key in ("open", "high", "low", "close"):
+                if abs(float(local_row[key]) - float(remote_row[key])) > 1e-8:
+                    self._log(
+                        f"Warmup cache invalid: candle mismatch at {_format_log_dt(pd.Timestamp(local_row['datetime']))}."
+                    )
+                    return None
+        return {"df": df, "cached_last_dt": cached_last_dt, "latest_exchange_dt": latest_exchange_dt}
+
+    def _catch_up_cached_market_state(self) -> int:
+        latest_rows = self._fetch_latest_closed_candles(limit=HISTORY_LIMIT)
+        if not latest_rows or self.last_processed_dt is None:
+            return 0
+        new_rows = [row for row in latest_rows if pd.Timestamp(row["datetime"]) > self.last_processed_dt]
+        applied = 0
+        for candle in new_rows:
+            idx = self._append_market_candle(candle)
+            if idx is None:
+                continue
+            self._detect_pivot(self.market_df, idx)
+            self.last_processed_dt = pd.Timestamp(candle["datetime"])
+            applied += 1
+        return applied
+
+    def _restore_warmup_cache(self) -> bool:
+        try:
+            validated = self._validate_warmup_cache()
+        except Exception as exc:
+            self._log(f"Warmup cache validation failed: {exc}")
+            return False
+        if not validated:
+            return False
+        self.market_df = self._update_indicators(validated["df"])
+        self.last_processed_dt = validated["cached_last_dt"]
+        self._rebuild_pivots_from_market_df()
+        applied = self._catch_up_cached_market_state()
+        self._save_state()
+        self._log(
+            f"Warmup cache restored: last_processed={_format_log_dt(self.last_processed_dt)}, "
+            f"cached_bars={len(self.market_df)}, catchup_bars={applied}"
+        )
+        return True
 
     def _detect_pivot(self, df: pd.DataFrame, idx: int) -> None:
         p = PIVOT_PERIOD
@@ -958,7 +1255,7 @@ class OkxPaperTrader:
             )
             return
         self._log(
-            f"{dt} signal: action=open_{pos_side}, reason={signal_reason}, close={close:.2f}, stop={stop:.2f}, "
+            f"{_format_log_dt(dt)} signal: action=open_{pos_side}, reason={signal_reason}, close={close:.2f}, stop={stop:.2f}, "
             f"atr={atr:.4f}, adx={adx:.2f}, bb_width={bb_width:.4f}, ema_spread={ema_spread:.4f}, "
             f"contracts={contracts}, base_size={plan['base_size']:.6f}, target_notional={plan['target_notional']:.2f}, "
             f"max_notional={plan['max_notional_now']:.2f}"
@@ -975,17 +1272,23 @@ class OkxPaperTrader:
         order_id = response.get("id", "")
         self.stop_price = stop
         self._log(
-            f"{dt} entry sent: side={pos_side}, contracts={contracts}, "
+            f"{_format_log_dt(dt)} entry sent: side={pos_side}, contracts={contracts}, "
             f"instId={self.inst_id}, bar={self.bar}, close={close:.2f}, stop={stop:.2f}, ordId={order_id}"
         )
         time.sleep(1.0)
         order_summary = self._fetch_order_summary(order_id)
         if order_summary:
+            self._record_daily_pnl(
+                dt,
+                fee_delta=order_summary.get("fee", 0.0),
+                opens_delta=1.0,
+            )
             self._log(
-                f"{dt} entry result: ordId={order_id}, state={order_summary.get('state')}, "
+                f"{_format_log_dt(dt)} entry result: ordId={order_id}, state={order_summary.get('state')}, "
                 f"avg_px={order_summary.get('avg_px', 0.0):.4f}, fill_sz={order_summary.get('acc_fill_sz', 0.0):.4f}, "
                 f"fee={order_summary.get('fee', 0.0):.6f}"
             )
+            self._log_daily_pnl_summary(dt)
         self._sync_position()
         self._log_account_snapshot("After entry")
         self._save_state()
@@ -995,7 +1298,7 @@ class OkxPaperTrader:
             return
         approx_pnl = (trigger_price - self.position.avg_price) * self.position.base_size * self.position.side
         self._log(
-            f"{dt} signal: action=close_{self.position.pos_side}, reason={reason}, trigger_price={trigger_price:.2f}, "
+            f"{_format_log_dt(dt)} signal: action=close_{self.position.pos_side}, reason={reason}, trigger_price={trigger_price:.2f}, "
             f"entry_price={self.position.avg_price:.2f}, contracts={self.position.contracts}, "
             f"base_size={self.position.base_size:.6f}, approx_pnl={approx_pnl:.4f}"
         )
@@ -1010,15 +1313,22 @@ class OkxPaperTrader:
             {"reduceOnly": True, "tdMode": TD_MODE, "posSide": self.position.pos_side},
         )
         order_id = response.get("id", "")
-        self._log(f"{dt} close sent: reason={reason}, posSide={self.position.pos_side}, ordId={order_id}")
+        self._log(f"{_format_log_dt(dt)} close sent: reason={reason}, posSide={self.position.pos_side}, ordId={order_id}")
         time.sleep(1.0)
         order_summary = self._fetch_order_summary(order_id)
         if order_summary:
+            self._record_daily_pnl(
+                dt,
+                realized_pnl_delta=order_summary.get("pnl", 0.0),
+                fee_delta=order_summary.get("fee", 0.0),
+                closes_delta=1.0,
+            )
             self._log(
-                f"{dt} close result: ordId={order_id}, state={order_summary.get('state')}, "
+                f"{_format_log_dt(dt)} close result: ordId={order_id}, state={order_summary.get('state')}, "
                 f"avg_px={order_summary.get('avg_px', 0.0):.4f}, fill_sz={order_summary.get('acc_fill_sz', 0.0):.4f}, "
                 f"fee={order_summary.get('fee', 0.0):.6f}, pnl={order_summary.get('pnl', 0.0):.4f}"
             )
+            self._log_daily_pnl_summary(dt)
         self._sync_position()
         self._log_account_snapshot("After close")
         self.last_exit_dt = dt
@@ -1030,13 +1340,26 @@ class OkxPaperTrader:
             raise RuntimeError("No candles available for bootstrap")
         self.highs = []
         self.lows = []
+        warmup_bars = min(_indicator_warmup_bars(), len(df))
+        self._log(
+            f"Warmup started: bars={warmup_bars}, total_history={len(df)}, "
+            f"mode={'replay_from_start_time' if self.start_time is not None else 'warmup_only'}"
+        )
         replay_started = False
         replay_bar_count = 0
         for idx in range(len(df)):
             dt = pd.Timestamp(df.iloc[idx]["datetime"])
-            if not replay_started and self.start_time is not None and dt >= self.start_time:
+            if (
+                not replay_started
+                and self.start_time is not None
+                and idx >= warmup_bars
+                and dt >= self.start_time
+            ):
                 replay_started = True
-                self._log(f"Bootstrap replay started: dt={dt}, configured_start_time={self.start_time}")
+                self._log(
+                    f"Bootstrap replay started: dt={_format_log_dt(dt)}, "
+                    f"configured_start_time={_format_log_dt(self.start_time)}"
+                )
             if replay_started:
                 # 这里是新脚本相对 bt_run.py 的补充：
                 # bt_run.py 天然是整段历史回测；实盘脚本需要先回放历史K线，把状态补齐后再接实时流。
@@ -1050,8 +1373,9 @@ class OkxPaperTrader:
         self.last_processed_dt = pd.Timestamp(df.iloc[-1]["datetime"])
         self._save_state()
         self._log(
-            f"Bootstrap done: last_processed={self.last_processed_dt}, "
-            f"instId={self.inst_id}, bar={self.bar}, start_time={self.start_time}, "
+            f"Warmup done: last_processed={_format_log_dt(self.last_processed_dt)}, "
+            f"instId={self.inst_id}, bar={self.bar}, warmup_bars={warmup_bars}, "
+            f"start_time={_format_log_dt(self.start_time)}, "
             f"replay_bars={replay_bar_count}, highs={self.highs[-2:]}, lows={self.lows[-2:]}, stop={self.stop_price}"
         )
 
@@ -1132,30 +1456,38 @@ class OkxPaperTrader:
     def run(self) -> None:
         consecutive_network_errors = 0
         loop_count = 0
-        snapshot = self._fetch_balance_snapshot()
+        self._fetch_balance_snapshot()
         if self.initial_equity is None:
-            self.initial_equity = snapshot["total_eq"] if snapshot["total_eq"] > 0 else INITIAL_CASH
+            self.initial_equity = INITIAL_CASH
         funding_snapshot = self._fetch_funding_balance()
         if self.initial_funding_balance is None:
             self.initial_funding_balance = funding_snapshot["balance"]
         self._log(
             f"Starting OKX paper trader: instId={self.inst_id}, bar={self.bar}, "
-            f"start_time={self.start_time}, "
+            f"start_time={_format_log_dt(self.start_time)}, "
             f"flag={self.config.get('flag', SIMULATED_FLAG)}, trading_eq={self.initial_equity:.2f}, "
             f"funding_bal={funding_snapshot['balance']:.2f}, state_file={self.state_path.name}"
         )
         self._log_account_snapshot("Startup snapshot", refresh=False)
-        while True:
-            try:
-                # 这里是新脚本和 bt_run.py 最大的运行差异：
-                # bt_run.py 直接喂整段历史做回测；这里先用 REST 历史K线重建状态，再切到实时WebSocket。
-                self.market_df = self._update_indicators(self._fetch_candles(bootstrap=True))
-                self._bootstrap_history(self.market_df)
-                self._save_state()
-                break
-            except Exception as exc:
-                self._log(f"Startup market bootstrap failed: {exc}")
-                time.sleep(POLL_SECONDS)
+        self._log_daily_pnl_summary()
+        restored_from_cache = False
+        try:
+            restored_from_cache = self._restore_warmup_cache()
+        except Exception as exc:
+            self._log(f"Warmup cache restore failed: {exc}")
+            restored_from_cache = False
+        if not restored_from_cache:
+            while True:
+                try:
+                    # 这里是新脚本和 bt_run.py 最大的运行差异：
+                    # bt_run.py 直接喂整段历史做回测；这里先用 REST 历史K线重建状态，再切到实时WebSocket。
+                    self.market_df = self._update_indicators(self._fetch_candles(bootstrap=True))
+                    self._bootstrap_history(self.market_df)
+                    self._save_state()
+                    break
+                except Exception as exc:
+                    self._log(f"Startup market bootstrap failed: {exc}")
+                    time.sleep(POLL_SECONDS)
 
         self.candle_stream.start()
 
@@ -1165,6 +1497,8 @@ class OkxPaperTrader:
                 # 对应 bt_run.py 的 next() 每根K线调用一次；
                 # 新脚本里只有收到一根新的已确认K线时，才触发一次同等策略判断。
                 candle = self.candle_stream.get_next_candle(timeout=WS_QUEUE_TIMEOUT_SECONDS)
+                if candle is None:
+                    candle = self._maybe_poll_latest_closed_candle()
                 has_new_bar = candle is not None and (
                     self.last_processed_dt is None or pd.Timestamp(candle["datetime"]) > self.last_processed_dt
                 )
@@ -1177,7 +1511,7 @@ class OkxPaperTrader:
                     continue
                 row = self.market_df.iloc[idx]
                 self._log(
-                    f"New bar: dt={pd.Timestamp(row['datetime'])}, close={float(row['close']):.2f}, "
+                    f"New bar: dt={_format_log_dt(pd.Timestamp(row['datetime']))}, close={float(row['close']):.2f}, "
                     f"position_side={self.position.side}, stop={self.stop_price}"
                 )
                 self._on_bar(self.market_df, idx)
