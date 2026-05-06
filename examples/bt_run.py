@@ -1,5 +1,4 @@
 import backtrader as bt
-import yfinance as yf
 import pandas as pd
 import os
 import datetime
@@ -16,8 +15,9 @@ DATA_SOURCES = {
     "btc_15m": "BTCUSD_15M_20260328_131652.csv",
     "eth_15m_105553": "ETHUSD_15M_20260413_105553.csv",
     "eth_15m_new": "ETHUSD_15M_20260413_115652.csv",
+    "eth_15m_2022":"ETHUSD_15M_20260502_144301.csv"
 }
-ACTIVE_DATA_SOURCE = "eth_15m_new"  # 在这里切换数据源键
+ACTIVE_DATA_SOURCE = "eth_15m_2022"  # 在这里切换数据源键
 DATA_SOURCE_SUBDIR = os.path.join("output", "kline")
 BACKTEST_INITIAL_CASH = 750.0  # 初始资金（USDT）
 
@@ -100,11 +100,9 @@ class RightSidePivotStrategy(bt.Strategy):
         """按真实权益口径统计月度收益率（与真实累计盈亏口径一致）。"""
         if not self.dt_records or not self.real_pnl_curve:
             return {}
-        # 真实权益 = 真实累计盈亏 + 初始本金
         real_equity = np.asarray(self.real_pnl_curve, dtype=float) + float(self.initial_equity)
         idx = pd.DatetimeIndex(self.dt_records)
         s = pd.Series(real_equity, index=idx).sort_index()
-        # 每月取该月最后一个时点的真实权益
         month_end_equity = s.groupby(s.index.to_period('M')).last()
 
         out = {}
@@ -116,16 +114,29 @@ class RightSidePivotStrategy(bt.Strategy):
             prev = cur
         return out
 
-    def _calc_order_size(self, close: float) -> float:
-        """按期初资金目标下单，并受当前可用保证金约束，尽量避免保证金拒单。"""
-        if close <= 0:
-            return 0.0
-        target_value = self.initial_equity * self.p.risk_percent * self.p.leverage
-        available_cash = max(float(self.broker.getcash()), 0.0)
-        max_notional_now = available_cash * self.p.leverage * self.p.order_utilization
-        notional = min(target_value, max_notional_now)
-        size = notional / close
-        return max(size, 0.0)
+    def get_profit_loss_stats(self):
+        """统计盈利/亏损汇总，并按总盈利/总亏损计算盈亏比。"""
+        if not self.trade_pnls:
+            return None
+
+        pnls = np.asarray([pnl for _, pnl in self.trade_pnls], dtype=float)
+        wins = pnls[pnls > 0]
+        losses = pnls[pnls < 0]
+        total_win = float(wins.sum()) if wins.size else 0.0
+        total_loss = float(np.abs(losses.sum())) if losses.size else 0.0
+        avg_win = float(wins.mean()) if wins.size else 0.0
+        avg_loss = float(np.abs(losses.mean())) if losses.size else 0.0
+        profit_loss_ratio = (total_win / total_loss) if total_loss > 0 else np.inf
+
+        return {
+            'win_count': int(wins.size),
+            'loss_count': int(losses.size),
+            'total_win': total_win,
+            'total_loss': total_loss,
+            'avg_win': avg_win,
+            'avg_loss': avg_loss,
+            'profit_loss_ratio': profit_loss_ratio,
+        }
 
     def _apply_cashflow_policy(self):
         """空仓时执行资金流策略：盈利取出、亏损回补（优先盈利池）。"""
@@ -133,7 +144,6 @@ class RightSidePivotStrategy(bt.Strategy):
             return
         current_value = float(self.broker.getvalue())
         eps = 1e-9
-        # 情况1：盈利取出
         if self.p.auto_withdraw_profit and current_value > self.initial_equity + eps:
             amount = current_value - self.initial_equity
             if hasattr(self.broker, "add_cash"):
@@ -145,7 +155,6 @@ class RightSidePivotStrategy(bt.Strategy):
             self.log(f"盈利取出: {amount:.2f}, 盈利池={self.profit_pool:.2f}")
             return
 
-        # 情况2：亏损补资（先用盈利池，不足部分记外部补资）
         if self.p.auto_topup_to_initial and current_value < self.initial_equity - eps:
             deficit = self.initial_equity - current_value
             pool_usable = max(self.profit_pool - self.p.profit_pool_floor, 0.0)
@@ -178,6 +187,17 @@ class RightSidePivotStrategy(bt.Strategy):
         external_left = self.p.max_external_topup - self.cum_topup_external
         current_real_pnl = float(self.broker.getvalue()) + self.cum_withdraw - self.cum_topup_external - float(self.initial_equity or 0.0)
         return (external_left > 1e-9) or (current_real_pnl > 0.0)
+
+    def _calc_order_size(self, close: float) -> float:
+        """按期初资金目标下单，并受当前可用保证金约束，尽量避免保证金拒单。"""
+        if close <= 0:
+            return 0.0
+        target_value = self.initial_equity * self.p.risk_percent * self.p.leverage
+        available_cash = max(float(self.broker.getcash()), 0.0)
+        max_notional_now = available_cash * self.p.leverage * self.p.order_utilization
+        notional = min(target_value, max_notional_now)
+        size = notional / close
+        return max(size, 0.0)
 
     def next(self):
         if self.initial_equity is None:
@@ -212,7 +232,6 @@ class RightSidePivotStrategy(bt.Strategy):
         if (not self.position) and self.funding_exhausted:
             if not self._can_continue_trading_when_funding_exhausted():
                 return  # 资金补充能力已耗尽，且无继续交易条件
-            # 满足继续交易条件时，允许继续开仓（不重置告警状态，避免重复刷屏）
 
         # 寻找分形高低点 (Fractal Pivots)
         # 判断当前K线往前推 pivot_period 根K线，是否是局部最高或最低
@@ -401,9 +420,9 @@ def plot_results(df_plot, strat, initial_cash):
         ax1.scatter(a_dt, a_p, marker='D', color='#17becf', s=70, label='Add Short', zorder=6)
     if hasattr(strat, 'close_points') and strat.close_points:
         c_pos_dt = [d for d, _, pnl in strat.close_points if pnl >= 0]
-        c_pos_p = [p for d, p, pnl in strat.close_points if pnl >= 0]
+        c_pos_p = [p for _, p, pnl in strat.close_points if pnl >= 0]
         c_neg_dt = [d for d, _, pnl in strat.close_points if pnl < 0]
-        c_neg_p = [p for d, p, pnl in strat.close_points if pnl < 0]
+        c_neg_p = [p for _, p, pnl in strat.close_points if pnl < 0]
         if c_pos_dt:
             ax1.scatter(c_pos_dt, c_pos_p, marker='x', color='green', s=140, linewidths=2.2, label='Close (Win)', zorder=7)
         if c_neg_dt:
@@ -459,7 +478,7 @@ def plot_results(df_plot, strat, initial_cash):
         if abs(s) >= 1e3:
             return f'{sign}{s/1e3:.1f}k'
         return f'{sign}{s:.0f}'
-    for x, y, b in zip(tp_dates, tp_values, bars):
+    for x, y, _ in zip(tp_dates, tp_values, bars):
         ax4.annotate(_fmt_pnl(y), xy=(x, y), xytext=(0, 6 if y >= 0 else -12), textcoords='offset points',
                      ha='center', va='bottom' if y >= 0 else 'top', fontsize=8,
                      color=('green' if y >= 0 else 'red'),
@@ -479,7 +498,7 @@ def plot_results(df_plot, strat, initial_cash):
     ax5.set_xlabel('Time', fontsize=12)
     ax5.legend(loc='upper left', fontsize=8, frameon=True, framealpha=0.8, borderpad=0.3, labelspacing=0.3, handlelength=1.5)
     ax5.grid(True, alpha=0.3)
-    
+
     # 时间轴格式化
     locator = mdates.AutoDateLocator(minticks=5, maxticks=8)
     formatter = mdates.ConciseDateFormatter(locator)
@@ -565,6 +584,7 @@ def plot_results(df_plot, strat, initial_cash):
             y_tp = tp_values[tp_idx]
         else:
             y_tp = 0.0
+        y_real = float(strat.real_pnl_curve[eq_idx]) if eq_idx >= 0 else 0.0
             
         # 隐藏所有横线和注释
         for h in hlines: h.set_visible(False)
@@ -595,7 +615,6 @@ def plot_results(df_plot, strat, initial_cash):
             hline4.set_ydata([y_tp, y_tp])
             hline4.set_visible(True)
         elif event.inaxes == ax5:
-            y_real = float(strat.real_pnl_curve[eq_idx]) if eq_idx >= 0 else 0.0
             ann5.xy = (xi, y_real)
             ann5.set_text(f"{x_dt[idx].strftime('%Y-%m-%d %H:%M')}\nReal PnL: {y_real:,.2f}")
             ann5.set_visible(True)
@@ -744,6 +763,16 @@ def my_strage():
         print('后备资金是否耗尽: %s' % ('是' if strat.funding_exhausted else '否'))
         print('盈利池余额: %.2f' % strat.profit_pool)
         print('真实累计盈亏: %.2f' % strat.real_pnl_curve[-1])
+    stats = strat.get_profit_loss_stats()
+    if stats:
+        ratio_text = 'inf' if np.isinf(stats['profit_loss_ratio']) else f"{stats['profit_loss_ratio']:.2f}"
+        print('盈利笔数: %d' % stats['win_count'])
+        print('亏损笔数: %d' % stats['loss_count'])
+        print('总盈利: %.2f' % stats['total_win'])
+        print('总亏损: %.2f' % stats['total_loss'])
+        print('平均单笔盈利: %.2f' % stats['avg_win'])
+        print('平均单笔亏损: %.2f' % stats['avg_loss'])
+        print('盈亏比: %s' % ratio_text)
     monthly = strat.get_real_monthly_returns()
     if monthly:
         print('月度收益率(真实口径, %)：')
