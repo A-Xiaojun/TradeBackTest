@@ -30,7 +30,7 @@ class RightSidePivotStrategy(bt.Strategy):
     - 止损：做多的止损设在最近一个波谷（低点），做空的止损设在最近一个波峰（高点）。
     """
     params = (
-        ('pivot_period', 5),  # 寻找局部高低点的窗口期（左右各看几根K线）
+        ('pivot_period', 8),  # 寻找局部高低点的窗口期（左右各看几根K线）
         ('risk_percent', 1.00), # 每次开仓使用资金比例 (100%，即全仓)
         ('leverage', 10.0),   # 新增：杠杆倍数，默认 10x
         ('order_utilization', 1.00),  # 可用保证金利用率（全仓）
@@ -48,6 +48,7 @@ class RightSidePivotStrategy(bt.Strategy):
         ('breakout_buffer_atr_mult', 0.10),
         ('min_ema_spread_pct', 0.003),  # EMA发散阈值：过小视为震荡
         ('cooldown_bars', 2),
+        ('debug_decision', True),  # 是否记录逐根K线决策日志
     )
 
     def __init__(self):
@@ -68,7 +69,8 @@ class RightSidePivotStrategy(bt.Strategy):
         self.equity_curve = []
         self.position_curve = []
         self.position_value_curve = [] # 新增：记录仓位的名义USDT价值
-        self.real_pnl_curve = []        # 真实累计盈亏曲线（扣除外部补资、加回取出）
+        self.realized_pnl = 0.0         # 累计已平仓净盈亏（仅按平仓trade.pnlcomm累加）
+        self.real_pnl_curve = []        # 累计已平仓净盈亏曲线（用于展示/统计）
         self.withdraw_curve = []        # 累计取出曲线
         self.external_topup_curve = []  # 累计外部补资曲线
         self.profit_pool_curve = []     # 盈利池余额曲线
@@ -86,6 +88,15 @@ class RightSidePivotStrategy(bt.Strategy):
         self.lows = []
         self.last_exit_bar = -10
         self.bar_count = 0
+        self.decision_log_path = None
+        if self.p.debug_decision:
+            out_dir = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'output')
+            os.makedirs(out_dir, exist_ok=True)
+            ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+            self.decision_log_path = os.path.join(out_dir, f"decision_log_{ACTIVE_DATA_SOURCE}_{ts}.log")
+            with open(self.decision_log_path, "a", encoding="utf-8") as fh:
+                fh.write("datetime,stage,reason,close,extras\n")
+            self.log(f"决策日志已写入: {self.decision_log_path}")
         
         # 记录给绘图用（占位，保持兼容原有绘图代码逻辑）
         # 如果需要可以在图中绘制，这里复用 ema_fast / ema_slow 的变量名来占位以防报错
@@ -97,7 +108,7 @@ class RightSidePivotStrategy(bt.Strategy):
         self.bb = bt.indicators.BollingerBands(self.datas[0], period=self.p.bb_period, devfactor=self.p.bb_dev)
 
     def get_real_monthly_returns(self):
-        """按真实权益口径统计月度收益率（与真实累计盈亏口径一致）。"""
+        """按已平仓累计盈亏口径统计月度收益率。"""
         if not self.dt_records or not self.real_pnl_curve:
             return {}
         real_equity = np.asarray(self.real_pnl_curve, dtype=float) + float(self.initial_equity)
@@ -199,6 +210,15 @@ class RightSidePivotStrategy(bt.Strategy):
         size = notional / close
         return max(size, 0.0)
 
+    def _log_decision(self, stage: str, reason: str, close: float, **kwargs):
+        """将逐根K线决策写入单独日志文件，便于排查为何下单/未下单。"""
+        if not self.p.debug_decision or not self.decision_log_path:
+            return
+        dt = self.datas[0].datetime.datetime(0).isoformat()
+        extras = ";".join([f"{k}={v}" for k, v in kwargs.items()]) if kwargs else ""
+        with open(self.decision_log_path, "a", encoding="utf-8") as fh:
+            fh.write(f"{dt},{stage},{reason},{close:.8f},{extras}\n")
+
     def next(self):
         if self.initial_equity is None:
             self.initial_equity = float(self.broker.getvalue())
@@ -209,8 +229,8 @@ class RightSidePivotStrategy(bt.Strategy):
         # 记录每根K线结束后的资金和仓位情况
         self.equity_curve.append(self.broker.getvalue())
         self.position_curve.append(self.position.size)
-        real_pnl = float(self.broker.getvalue()) + self.cum_withdraw - self.cum_topup_external - self.initial_equity
-        self.real_pnl_curve.append(real_pnl)
+        # “真实累计盈亏”统一为仅按平仓净利润累加，不受浮动盈亏与资金流影响
+        self.real_pnl_curve.append(float(self.realized_pnl))
         self.withdraw_curve.append(self.cum_withdraw)
         self.external_topup_curve.append(self.cum_topup_external)
         self.profit_pool_curve.append(self.profit_pool)
@@ -228,9 +248,11 @@ class RightSidePivotStrategy(bt.Strategy):
         self.bar_count += 1
         
         if self.order:
+            self._log_decision("skip", "pending_order", current_close)
             return  # 有挂单则不处理
         if (not self.position) and self.funding_exhausted:
             if not self._can_continue_trading_when_funding_exhausted():
+                self._log_decision("skip", "funding_exhausted", current_close)
                 return  # 资金补充能力已耗尽，且无继续交易条件
 
         # 寻找分形高低点 (Fractal Pivots)
@@ -239,6 +261,7 @@ class RightSidePivotStrategy(bt.Strategy):
         
         # 确保有足够的数据历史
         if len(self.datas[0]) < p * 2 + 1:
+            self._log_decision("skip", "insufficient_history", current_close, need=p * 2 + 1, have=len(self.datas[0]))
             return
 
         # 获取前后 p 根 K 线的最高价和最低价数组
@@ -246,6 +269,7 @@ class RightSidePivotStrategy(bt.Strategy):
         low_slice = self.datas[0].low.get(ago=-p, size=p*2+1)
         
         if len(high_slice) != p*2+1:
+            self._log_decision("skip", "invalid_pivot_window", current_close, expected=p * 2 + 1, actual=len(high_slice))
             return
 
         center_high = high_slice[p]
@@ -273,24 +297,60 @@ class RightSidePivotStrategy(bt.Strategy):
         if hasattr(self.bb, 'top') and hasattr(self.bb, 'bot') and close != 0:
             bb_width = (self.bb.top[0] - self.bb.bot[0]) / abs(close)
         if not self.position and (self.bar_count - self.last_exit_bar) <= self.p.cooldown_bars:
+            self._log_decision(
+                "skip",
+                "cooldown",
+                close,
+                bars_since_exit=(self.bar_count - self.last_exit_bar),
+                cooldown_bars=self.p.cooldown_bars,
+            )
             return
         ema_spread = 0.0
         if close != 0:
             ema_spread = abs(self.ema_fast[0] - self.ema_slow[0]) / abs(close)
-        # 更严格的震荡过滤：任一条件不满足都跳过（低ADX / 带宽窄 / EMA粘合）
-        if (self.adx[0] < self.p.adx_threshold) or (bb_width < self.p.bb_bandwidth_threshold) or (ema_spread < self.p.min_ema_spread_pct):
-            return
 
         # ---------------- 交易逻辑 ----------------
         if not self.position:
+            # 震荡过滤仅用于“开仓判断”，不阻断持仓后的止损/离场
+            if (self.adx[0] < self.p.adx_threshold) or (bb_width < self.p.bb_bandwidth_threshold) or (ema_spread < self.p.min_ema_spread_pct):
+                self._log_decision(
+                    "skip",
+                    "chop_filter",
+                    close,
+                    adx=f"{self.adx[0]:.2f}",
+                    adx_threshold=f"{self.p.adx_threshold:.2f}",
+                    bb_width=f"{bb_width:.4f}",
+                    bb_threshold=f"{self.p.bb_bandwidth_threshold:.4f}",
+                    ema_spread=f"{ema_spread:.4f}",
+                    ema_threshold=f"{self.p.min_ema_spread_pct:.4f}",
+                )
+                return
             # 1. 寻找做多机会：形成越来越高的低点 (Higher Lows) 即入场
             if len(self.lows) >= 2:
                 # 判断最近两个低点是否抬高
                 swing_ok = (self.lows[-1] - self.lows[-2]) >= self.p.min_swing_atr_mult * max(self.atr[0], 1e-9)
                 if self.lows[-1] > self.lows[-2] and swing_ok:
+                    if self.lows[-1] >= close:
+                        self._log_decision(
+                            "skip",
+                            "invalid_long_stop_relation",
+                            close,
+                            stop=f"{self.lows[-1]:.2f}",
+                        )
+                        return
                     size = self._calc_order_size(close)
                     if size <= 0:
+                        self._log_decision("skip", "size_zero_long", close)
                         return
+                    self._log_decision(
+                        "entry",
+                        "higher_low",
+                        close,
+                        stop=f"{self.lows[-1]:.2f}",
+                        size=f"{size:.6f}",
+                        low_prev=f"{self.lows[-2]:.2f}",
+                        low_last=f"{self.lows[-1]:.2f}",
+                    )
                     self.order = self.buy(size=size)
                     self.stop_price = self.lows[-1] # 止损设在最近的低点拐点
                     self.log(f"做多信号(Higher Low): 价格={close:.2f}, 止损={self.stop_price:.2f}, 杠杆={self.p.leverage}x")
@@ -300,9 +360,27 @@ class RightSidePivotStrategy(bt.Strategy):
                 # 判断最近两个高点是否降低
                 swing_ok = (self.highs[-2] - self.highs[-1]) >= self.p.min_swing_atr_mult * max(self.atr[0], 1e-9)
                 if self.highs[-1] < self.highs[-2] and swing_ok:
+                    if self.highs[-1] <= close:
+                        self._log_decision(
+                            "skip",
+                            "invalid_short_stop_relation",
+                            close,
+                            stop=f"{self.highs[-1]:.2f}",
+                        )
+                        return
                     size = self._calc_order_size(close)
                     if size <= 0:
+                        self._log_decision("skip", "size_zero_short", close)
                         return
+                    self._log_decision(
+                        "entry",
+                        "lower_high",
+                        close,
+                        stop=f"{self.highs[-1]:.2f}",
+                        size=f"{size:.6f}",
+                        high_prev=f"{self.highs[-2]:.2f}",
+                        high_last=f"{self.highs[-1]:.2f}",
+                    )
                     self.order = self.sell(size=size)
                     self.stop_price = self.highs[-1] # 止损设在最近的高点拐点
                     self.log(f"做空信号(Lower High): 价格={close:.2f}, 止损={self.stop_price:.2f}, 杠杆={self.p.leverage}x")
@@ -312,20 +390,24 @@ class RightSidePivotStrategy(bt.Strategy):
             if self.position.size > 0:
                 # 多头止损
                 if close <= self.stop_price:
+                    self._log_decision("exit", "long_stop", close, stop=f"{self.stop_price:.2f}")
                     self.log(f"多头触及拐点止损平仓: {close:.2f} (止损价: {self.stop_price:.2f})")
                     self.order = self.close()
                 # 简单止盈：如果出现了降低的高点，说明上涨动能衰竭，平多
                 elif len(self.highs) >= 2 and self.highs[-1] < self.highs[-2]:
+                    self._log_decision("exit", "long_momentum_exhausted", close)
                     self.log(f"多头动能衰竭(出现Lower High)平仓: {close:.2f}")
                     self.order = self.close()
                     
             elif self.position.size < 0:
                 # 空头止损
                 if close >= self.stop_price:
+                    self._log_decision("exit", "short_stop", close, stop=f"{self.stop_price:.2f}")
                     self.log(f"空头触及拐点止损平仓: {close:.2f} (止损价: {self.stop_price:.2f})")
                     self.order = self.close()
                 # 简单止盈：如果出现了抬高的低点，说明下跌动能衰竭，平空
                 elif len(self.lows) >= 2 and self.lows[-1] > self.lows[-2]:
+                    self._log_decision("exit", "short_momentum_exhausted", close)
                     self.log(f"空头动能衰竭(出现Higher Low)平仓: {close:.2f}")
                     self.order = self.close()
 
@@ -371,6 +453,7 @@ class RightSidePivotStrategy(bt.Strategy):
             self.stop_price = None
             dt = self.datas[0].datetime.datetime(0)
             self.trade_pnls.append((dt, float(trade.pnlcomm)))
+            self.realized_pnl += float(trade.pnlcomm)
             # 记录平仓点（用于图1 Close Win/Loss）
             pr = float(self.datas[0].close[0])
             self.close_points.append((dt, pr, float(trade.pnlcomm)))
@@ -708,7 +791,9 @@ class CryptoCommissionInfo(bt.CommissionInfo):
 def my_strage():
     print("开始回测...")
     # 创建Cerebro引擎  
-    cerebro = bt.Cerebro() 
+    cerebro = bt.Cerebro()
+    # 兼容写法：按当前K线收盘价成交（Cheat-On-Close）
+    cerebro.broker.set_coc(True)
 
     # 替换为新的右侧拐点策略
     cerebro.addstrategy(RightSidePivotStrategy)
@@ -775,7 +860,7 @@ def my_strage():
         print('盈亏比: %s' % ratio_text)
     monthly = strat.get_real_monthly_returns()
     if monthly:
-        print('月度收益率(真实口径, %)：')
+        print('月度收益率(平仓口径, %)：')
         for k, v in sorted(monthly.items(), key=lambda x: x[0]):
             print(f'  {k}: {v*100:.2f}%')
     
