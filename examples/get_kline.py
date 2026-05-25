@@ -4,8 +4,35 @@ import pandas as pd
 import datetime
 import time
 import os
+import json
+from pathlib import Path
 
 DEFAULT_EXCHANGES = ["okx", "binance"]
+
+
+def _load_runtime_config():
+    base_dir = Path(__file__).resolve().parent
+    candidates = [base_dir / "config.local", base_dir / "config"]
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                return json.load(fh), str(path)
+        except Exception as exc:
+            print(f"读取配置失败: {path} -> {exc}")
+    return {}, None
+
+
+def _resolve_proxy():
+    cfg, cfg_path = _load_runtime_config()
+    proxy = (
+        cfg.get("proxy")
+        or os.getenv("HTTPS_PROXY")
+        or os.getenv("HTTP_PROXY")
+        or os.getenv("ALL_PROXY")
+    )
+    return proxy, cfg_path
 
 def _format_symbol_for_filename(symbol: str) -> str:
     name = symbol.replace('/', '-').upper()
@@ -25,7 +52,14 @@ def _create_exchange(exchange_name: str, timeout_ms: int = 30000):
     if not hasattr(ccxt, exchange_name):
         raise ValueError(f"不支持的交易所: {exchange_name}")
     klass = getattr(ccxt, exchange_name)
-    return klass({'timeout': timeout_ms, 'enableRateLimit': True})
+    proxy, cfg_path = _resolve_proxy()
+    exchange = klass({'timeout': timeout_ms, 'enableRateLimit': True})
+    if proxy:
+        exchange.httpsProxy = proxy
+        print(f"[{exchange_name}] 使用代理: {proxy} (来源: {cfg_path or 'environment'})")
+    else:
+        print(f"[{exchange_name}] 未启用代理")
+    return exchange
 
 
 def fetch_kline_range(
@@ -102,7 +136,7 @@ def fetch_okx_kline_range(symbol, timeframe, start_iso=None, end_iso=None, limit
     )
 
 def fetch_okx_kline(symbol, timeframe, limit, filename=None):
-    exchange = ccxt.okx({'timeout': 30000})
+    exchange = _create_exchange("okx")
     # 得到最新数据
     ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])

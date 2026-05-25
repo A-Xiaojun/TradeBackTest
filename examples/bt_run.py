@@ -2,14 +2,18 @@ import backtrader as bt
 import pandas as pd
 import os
 import datetime
-import sys # 获取当前运行脚本的路径 (in argv[0]) 
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import numpy as np
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, "output")
+
 # ---------------- 数据源配置（只需改这里） ----------------
 DATA_SOURCES = {
     "eth_1h": "ETHUSD_1H_20260413_104040.csv",
+    "eth_4h_auto": "ETHUSD_4H_20210525_auto.csv",
     "btc_1h_new": "BTCUSD_1H_20260412_062757.csv",
     "btc_1h_old": "BTC-USD_1H_20251111_221506.csv",
     "btc_15m": "BTCUSD_15M_20260328_131652.csv",
@@ -17,9 +21,92 @@ DATA_SOURCES = {
     "eth_15m_new": "ETHUSD_15M_20260413_115652.csv",
     "eth_15m_2022":"ETHUSD_15M_20260502_144301.csv"
 }
-ACTIVE_DATA_SOURCE = "eth_15m_2022"  # 在这里切换数据源键
+ACTIVE_DATA_SOURCE = "eth_4h_auto"  # 在这里切换数据源键
 DATA_SOURCE_SUBDIR = os.path.join("output", "kline")
 BACKTEST_INITIAL_CASH = 750.0  # 初始资金（USDT）
+
+
+def get_output_dir():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    return OUTPUT_DIR
+
+
+def build_data_path(data_file):
+    return os.path.join(PROJECT_ROOT, DATA_SOURCE_SUBDIR, data_file)
+
+
+def build_chart_title(data_file):
+    symbol = data_file.split("_")[0].upper()
+    return f"{symbol} Trading Strategy ({ACTIVE_DATA_SOURCE})"
+
+
+def infer_feed_params(index):
+    if len(index) < 2:
+        return bt.TimeFrame.Minutes, 1
+    step = index.to_series().diff().dropna().median()
+    if pd.isna(step):
+        return bt.TimeFrame.Minutes, 1
+    minutes = max(int(round(step.total_seconds() / 60.0)), 1)
+    if minutes % (24 * 60) == 0:
+        return bt.TimeFrame.Days, max(minutes // (24 * 60), 1)
+    return bt.TimeFrame.Minutes, minutes
+
+
+def is_interactive_backend():
+    return "agg" not in plt.get_backend().lower()
+
+
+def build_date_locator(start_dt, end_dt):
+    total_days = max((end_dt - start_dt).days, 1)
+    if total_days >= 3 * 365:
+        return mdates.YearLocator()
+    if total_days >= 365:
+        return mdates.MonthLocator(interval=3)
+    if total_days >= 180:
+        return mdates.MonthLocator(interval=1)
+    return mdates.AutoDateLocator(minticks=5, maxticks=8)
+
+
+def _extract_first_figure(plot_result):
+    if hasattr(plot_result, "savefig"):
+        return plot_result
+    if isinstance(plot_result, (list, tuple)):
+        for item in plot_result:
+            fig = _extract_first_figure(item)
+            if fig is not None:
+                return fig
+    return None
+
+
+class MarginUsedObserver(bt.Observer):
+    lines = ('margin_used',)
+    plotinfo = dict(subplot=True, plotname='Margin Used')
+    plotlines = dict(
+        margin_used=dict(color='#17becf', _name='Margin Used (USDT)')
+    )
+
+    def next(self):
+        close = float(self._owner.datas[0].close[0])
+        size = float(self._owner.position.size)
+        leverage = max(float(self._owner.p.leverage), 1e-9)
+        self.lines.margin_used[0] = abs(size * close) / leverage if size else 0.0
+
+
+class CashflowObserver(bt.Observer):
+    lines = ('real_pnl', 'cum_withdraw', 'cum_external_topup', 'profit_pool')
+    plotinfo = dict(subplot=True, plotname='Real PnL & Cashflow')
+    plotlines = dict(
+        real_pnl=dict(color='#1f77b4', _name='Real PnL'),
+        cum_withdraw=dict(color='green', ls='--', _name='Cum Withdraw'),
+        cum_external_topup=dict(color='red', ls='--', _name='Cum External Topup'),
+        profit_pool=dict(color='#ff7f0e', ls=':', _name='Profit Pool'),
+    )
+
+    def next(self):
+        self.lines.real_pnl[0] = float(self._owner.realized_pnl)
+        self.lines.cum_withdraw[0] = float(self._owner.cum_withdraw)
+        self.lines.cum_external_topup[0] = float(self._owner.cum_topup_external)
+        self.lines.profit_pool[0] = float(self._owner.profit_pool)
 
 class RightSidePivotStrategy(bt.Strategy):
     """
@@ -27,13 +114,14 @@ class RightSidePivotStrategy(bt.Strategy):
     - 做多：寻找越来越高的低点 (Higher Lows)。当一轮小回调结束，价格重新向上拐头突破时入场。
     - 做空：寻找越来越低的高点 (Lower Highs)。当反弹结束，价格重新向下拐头跌破时入场。
     - 仓位：每次信号只使用当前总资金的 10% 进行开仓。
-    - 止损：做多的止损设在最近一个波谷（低点），做空的止损设在最近一个波峰（高点）。
+    - 止损：按成交后的单笔名义资金固定风险比例设置，默认亏损到名义仓位的 5% 即止损。
     """
     params = (
         ('pivot_period', 8),  # 寻找局部高低点的窗口期（左右各看几根K线）
-        ('risk_percent', 1.00), # 每次开仓使用资金比例 (100%，即全仓)
+        ('risk_percent', 0.10), # 每次开仓使用资金比例 (10%)
         ('leverage', 10.0),   # 新增：杠杆倍数，默认 10x
-        ('order_utilization', 1.00),  # 可用保证金利用率（全仓）
+        ('order_utilization', 0.95),  # 可用保证金利用率，留少量缓冲避免临界拒单
+        ('stop_loss_pct_of_notional', 0.10),  # 单笔名义资金允许亏损比例
         ('auto_topup_to_initial', True),  # 当前资金低于期初时，自动补到期初
         ('auto_withdraw_profit', True),   # 当前资金高于期初时，自动取出利润
         ('max_external_topup', 2600.0),   # 后备资金上限（总额，USDT）
@@ -41,11 +129,13 @@ class RightSidePivotStrategy(bt.Strategy):
         ('atr_period', 14),
         ('adx_period', 14),
         ('adx_threshold', 18.0),
+        ('short_adx_threshold', 24.0),
         ('bb_period', 20),
         ('bb_dev', 2.0),
         ('bb_bandwidth_threshold', 0.010),
         ('min_swing_atr_mult', 0.6),
         ('breakout_buffer_atr_mult', 0.10),
+        ('short_breakout_buffer_atr_mult', 0.18),
         ('min_ema_spread_pct', 0.003),  # EMA发散阈值：过小视为震荡
         ('cooldown_bars', 2),
         ('debug_decision', True),  # 是否记录逐根K线决策日志
@@ -53,6 +143,7 @@ class RightSidePivotStrategy(bt.Strategy):
 
     def __init__(self):
         self.order = None
+        self.stop_order = None
         self.buyprice = None
         self.buycomm = None
         self.stop_price = None
@@ -90,7 +181,7 @@ class RightSidePivotStrategy(bt.Strategy):
         self.bar_count = 0
         self.decision_log_path = None
         if self.p.debug_decision:
-            out_dir = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'output')
+            out_dir = get_output_dir()
             os.makedirs(out_dir, exist_ok=True)
             ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
             self.decision_log_path = os.path.join(out_dir, f"decision_log_{ACTIVE_DATA_SOURCE}_{ts}.log")
@@ -98,10 +189,15 @@ class RightSidePivotStrategy(bt.Strategy):
                 fh.write("datetime,stage,reason,close,extras\n")
             self.log(f"决策日志已写入: {self.decision_log_path}")
         
-        # 记录给绘图用（占位，保持兼容原有绘图代码逻辑）
-        # 如果需要可以在图中绘制，这里复用 ema_fast / ema_slow 的变量名来占位以防报错
-        self.ema_fast = bt.indicators.SMA(self.datas[0], period=10) 
-        self.ema_slow = bt.indicators.SMA(self.datas[0], period=20)
+        # EMA144/169 用于大方向过滤；SMA10/20 用于近端入场过滤
+        self.filter_ma_fast = bt.indicators.SMA(self.datas[0], period=10, subplot=False)
+        self.filter_ma_slow = bt.indicators.SMA(self.datas[0], period=20, subplot=False)
+        self.plot_ema_fast = bt.indicators.ExponentialMovingAverage(
+            self.datas[0], period=144, subplot=False, plotname='EMA(144)'
+        )
+        self.plot_ema_slow = bt.indicators.ExponentialMovingAverage(
+            self.datas[0], period=169, subplot=False, plotname='EMA(169)'
+        )
         # 震荡/波动过滤指标（不用于趋势方向，只用于去噪）
         self.atr = bt.indicators.ATR(self.datas[0], period=self.p.atr_period)
         self.adx = bt.indicators.AverageDirectionalMovementIndex(self.datas[0], period=self.p.adx_period)
@@ -120,7 +216,9 @@ class RightSidePivotStrategy(bt.Strategy):
         prev = float(self.initial_equity)
         for p, v in month_end_equity.items():
             cur = float(v)
-            ret = (cur / prev - 1.0) if prev > 0 else np.nan
+            if prev <= 0 or cur <= 0:
+                break
+            ret = (cur / prev - 1.0)
             out[str(p)] = ret
             prev = cur
         return out
@@ -210,6 +308,34 @@ class RightSidePivotStrategy(bt.Strategy):
         size = notional / close
         return max(size, 0.0)
 
+    def _calc_stop_price_from_entry(self, entry_price: float, is_long: bool) -> float:
+        """按单笔名义仓位的固定亏损比例换算止损价。"""
+        if entry_price <= 0:
+            return 0.0
+        move_pct = self.p.stop_loss_pct_of_notional
+        return entry_price * (1.0 - move_pct) if is_long else entry_price * (1.0 + move_pct)
+
+    def _cancel_stop_order(self):
+        if self.stop_order is not None:
+            self.cancel(self.stop_order)
+
+    def _place_stop_order(self, is_long: bool, size: float):
+        if size <= 0 or self.stop_price is None or self.stop_price <= 0:
+            return
+        self._cancel_stop_order()
+        if is_long:
+            self.stop_order = self.sell(
+                size=size,
+                exectype=bt.Order.Stop,
+                price=self.stop_price,
+            )
+        else:
+            self.stop_order = self.buy(
+                size=size,
+                exectype=bt.Order.Stop,
+                price=self.stop_price,
+            )
+
     def _log_decision(self, stage: str, reason: str, close: float, **kwargs):
         """将逐根K线决策写入单独日志文件，便于排查为何下单/未下单。"""
         if not self.p.debug_decision or not self.decision_log_path:
@@ -218,6 +344,10 @@ class RightSidePivotStrategy(bt.Strategy):
         extras = ";".join([f"{k}={v}" for k, v in kwargs.items()]) if kwargs else ""
         with open(self.decision_log_path, "a", encoding="utf-8") as fh:
             fh.write(f"{dt},{stage},{reason},{close:.8f},{extras}\n")
+
+    def prenext(self):
+        # 允许长周期绘图指标存在时，策略仍按原先的历史长度门槛开始运行
+        self.next()
 
     def next(self):
         if self.initial_equity is None:
@@ -307,7 +437,14 @@ class RightSidePivotStrategy(bt.Strategy):
             return
         ema_spread = 0.0
         if close != 0:
-            ema_spread = abs(self.ema_fast[0] - self.ema_slow[0]) / abs(close)
+            ema_spread = abs(self.filter_ma_fast[0] - self.filter_ma_slow[0]) / abs(close)
+        atr_now = max(self.atr[0], 1e-9)
+        long_breakout_buffer = self.p.breakout_buffer_atr_mult * atr_now
+        short_breakout_buffer = self.p.short_breakout_buffer_atr_mult * atr_now
+        macro_long_ok = self.plot_ema_fast[0] > self.plot_ema_slow[0]
+        macro_short_ok = self.plot_ema_fast[0] < self.plot_ema_slow[0]
+        micro_long_ok = self.filter_ma_fast[0] > self.filter_ma_slow[0]
+        micro_short_ok = self.filter_ma_fast[0] < self.filter_ma_slow[0]
 
         # ---------------- 交易逻辑 ----------------
         if not self.position:
@@ -326,89 +463,77 @@ class RightSidePivotStrategy(bt.Strategy):
                 )
                 return
             # 1. 寻找做多机会：形成越来越高的低点 (Higher Lows) 即入场
-            if len(self.lows) >= 2:
+            if len(self.lows) >= 2 and len(self.highs) >= 1:
                 # 判断最近两个低点是否抬高
-                swing_ok = (self.lows[-1] - self.lows[-2]) >= self.p.min_swing_atr_mult * max(self.atr[0], 1e-9)
-                if self.lows[-1] > self.lows[-2] and swing_ok:
-                    if self.lows[-1] >= close:
-                        self._log_decision(
-                            "skip",
-                            "invalid_long_stop_relation",
-                            close,
-                            stop=f"{self.lows[-1]:.2f}",
-                        )
-                        return
+                swing_ok = (self.lows[-1] - self.lows[-2]) >= self.p.min_swing_atr_mult * atr_now
+                breakout_level = self.highs[-1] + long_breakout_buffer
+                breakout_ok = close >= breakout_level
+                adx_ok = self.adx[0] >= self.p.adx_threshold
+                if self.lows[-1] > self.lows[-2] and swing_ok and macro_long_ok and micro_long_ok and breakout_ok and adx_ok:
                     size = self._calc_order_size(close)
                     if size <= 0:
                         self._log_decision("skip", "size_zero_long", close)
                         return
+                    stop_price = self._calc_stop_price_from_entry(close, is_long=True)
                     self._log_decision(
                         "entry",
                         "higher_low",
                         close,
-                        stop=f"{self.lows[-1]:.2f}",
+                        stop=f"{stop_price:.2f}",
                         size=f"{size:.6f}",
                         low_prev=f"{self.lows[-2]:.2f}",
                         low_last=f"{self.lows[-1]:.2f}",
+                        breakout_level=f"{breakout_level:.2f}",
                     )
                     self.order = self.buy(size=size)
-                    self.stop_price = self.lows[-1] # 止损设在最近的低点拐点
-                    self.log(f"做多信号(Higher Low): 价格={close:.2f}, 止损={self.stop_price:.2f}, 杠杆={self.p.leverage}x")
+                    self.log(f"做多信号(Higher Low): 价格={close:.2f}, 预计止损={stop_price:.2f}, 杠杆={self.p.leverage}x")
 
             # 2. 寻找做空机会：形成越来越低的高点 (Lower Highs) 即入场
-            if len(self.highs) >= 2 and not self.order:
+            if len(self.highs) >= 2 and len(self.lows) >= 1 and not self.order:
                 # 判断最近两个高点是否降低
-                swing_ok = (self.highs[-2] - self.highs[-1]) >= self.p.min_swing_atr_mult * max(self.atr[0], 1e-9)
-                if self.highs[-1] < self.highs[-2] and swing_ok:
-                    if self.highs[-1] <= close:
-                        self._log_decision(
-                            "skip",
-                            "invalid_short_stop_relation",
-                            close,
-                            stop=f"{self.highs[-1]:.2f}",
-                        )
-                        return
+                swing_ok = (self.highs[-2] - self.highs[-1]) >= self.p.min_swing_atr_mult * atr_now
+                breakout_level = self.lows[-1] - short_breakout_buffer
+                breakout_ok = close <= breakout_level
+                adx_ok = self.adx[0] >= self.p.short_adx_threshold
+                if self.highs[-1] < self.highs[-2] and swing_ok and macro_short_ok and micro_short_ok and breakout_ok and adx_ok:
                     size = self._calc_order_size(close)
                     if size <= 0:
                         self._log_decision("skip", "size_zero_short", close)
                         return
+                    stop_price = self._calc_stop_price_from_entry(close, is_long=False)
                     self._log_decision(
                         "entry",
                         "lower_high",
                         close,
-                        stop=f"{self.highs[-1]:.2f}",
+                        stop=f"{stop_price:.2f}",
                         size=f"{size:.6f}",
                         high_prev=f"{self.highs[-2]:.2f}",
                         high_last=f"{self.highs[-1]:.2f}",
+                        breakout_level=f"{breakout_level:.2f}",
                     )
                     self.order = self.sell(size=size)
-                    self.stop_price = self.highs[-1] # 止损设在最近的高点拐点
-                    self.log(f"做空信号(Lower High): 价格={close:.2f}, 止损={self.stop_price:.2f}, 杠杆={self.p.leverage}x")
+                    self.log(f"做空信号(Lower High): 价格={close:.2f}, 预计止损={stop_price:.2f}, 杠杆={self.p.leverage}x")
 
         else:
             # ---------------- 止损/平仓逻辑 ----------------
             if self.position.size > 0:
-                # 多头止损
-                if close <= self.stop_price:
-                    self._log_decision("exit", "long_stop", close, stop=f"{self.stop_price:.2f}")
-                    self.log(f"多头触及拐点止损平仓: {close:.2f} (止损价: {self.stop_price:.2f})")
-                    self.order = self.close()
-                # 简单止盈：如果出现了降低的高点，说明上涨动能衰竭，平多
-                elif len(self.highs) >= 2 and self.highs[-1] < self.highs[-2]:
+                # 固定止损改为真实 Stop 订单挂出，这里只处理主动离场逻辑
+                momentum_reversal = len(self.highs) >= 2 and self.highs[-1] < self.highs[-2]
+                ma_confirm = close < self.filter_ma_fast[0]
+                if momentum_reversal and ma_confirm:
                     self._log_decision("exit", "long_momentum_exhausted", close)
-                    self.log(f"多头动能衰竭(出现Lower High)平仓: {close:.2f}")
+                    self.log(f"多头动能衰竭双确认平仓: {close:.2f} (SMA10={self.filter_ma_fast[0]:.2f})")
+                    self._cancel_stop_order()
                     self.order = self.close()
                     
             elif self.position.size < 0:
-                # 空头止损
-                if close >= self.stop_price:
-                    self._log_decision("exit", "short_stop", close, stop=f"{self.stop_price:.2f}")
-                    self.log(f"空头触及拐点止损平仓: {close:.2f} (止损价: {self.stop_price:.2f})")
-                    self.order = self.close()
-                # 简单止盈：如果出现了抬高的低点，说明下跌动能衰竭，平空
-                elif len(self.lows) >= 2 and self.lows[-1] > self.lows[-2]:
+                # 固定止损改为真实 Stop 订单挂出，这里只处理主动离场逻辑
+                momentum_reversal = len(self.lows) >= 2 and self.lows[-1] > self.lows[-2]
+                ma_confirm = close > self.filter_ma_fast[0]
+                if momentum_reversal and ma_confirm:
                     self._log_decision("exit", "short_momentum_exhausted", close)
-                    self.log(f"空头动能衰竭(出现Higher Low)平仓: {close:.2f}")
+                    self.log(f"空头动能衰竭双确认平仓: {close:.2f} (SMA10={self.filter_ma_fast[0]:.2f})")
+                    self._cancel_stop_order()
                     self.order = self.close()
 
     def log(self, txt, dt=None):
@@ -416,6 +541,23 @@ class RightSidePivotStrategy(bt.Strategy):
         print(f'{dt.isoformat()}, {txt}')
 
     def notify_order(self, order):
+        if self.stop_order is not None and order.ref == self.stop_order.ref:
+            if order.status == order.Completed:
+                dt = self.datas[0].datetime.datetime(0)
+                side = '多头' if order.issell() else '空头'
+                self.trade_markers['sell' if order.issell() else 'buy'].append((dt, order.executed.price))
+                self._log_decision(
+                    "exit",
+                    "long_stop" if order.issell() else "short_stop",
+                    float(order.executed.price),
+                    stop=f"{self.stop_price:.2f}" if self.stop_price is not None else "0.00",
+                )
+                self.log(f'{side}止损单成交: {order.executed.price:.2f}, 数量: {order.executed.size:.4f}')
+                self.stop_order = None
+            elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+                self.stop_order = None
+            return
+
         if order.status in [order.Completed]:
             dt = self.datas[0].datetime.datetime(0)
             if order.isbuy():
@@ -428,6 +570,9 @@ class RightSidePivotStrategy(bt.Strategy):
                 price = float(order.executed.price)
                 if abs(prior_size) < 1e-12 and new_size > 0:
                     self.marker_entry_long.append((dt, price))
+                    self.stop_price = self._calc_stop_price_from_entry(price, is_long=True)
+                    self._place_stop_order(is_long=True, size=abs(new_size))
+                    self.log(f'多头固定止损已设置: {self.stop_price:.2f} (名义仓位风险 {self.p.stop_loss_pct_of_notional*100:.1f}%)')
                 elif prior_size > 0 and new_size > prior_size:
                     self.marker_add_long.append((dt, price))
             elif order.issell():
@@ -439,6 +584,9 @@ class RightSidePivotStrategy(bt.Strategy):
                 price = float(order.executed.price)
                 if abs(prior_size) < 1e-12 and new_size < 0:
                     self.marker_entry_short.append((dt, price))
+                    self.stop_price = self._calc_stop_price_from_entry(price, is_long=False)
+                    self._place_stop_order(is_long=False, size=abs(new_size))
+                    self.log(f'空头固定止损已设置: {self.stop_price:.2f} (名义仓位风险 {self.p.stop_loss_pct_of_notional*100:.1f}%)')
                 elif prior_size < 0 and abs(new_size) > abs(prior_size):
                     self.marker_add_short.append((dt, price))
             self.buyprice = order.executed.price
@@ -450,6 +598,8 @@ class RightSidePivotStrategy(bt.Strategy):
     def notify_trade(self, trade):
         if trade.isclosed:
             self.log(f'交易结束, 毛利润: {trade.pnl:.2f}, 净利润: {trade.pnlcomm:.2f}')
+            self._cancel_stop_order()
+            self.stop_order = None
             self.stop_price = None
             dt = self.datas[0].datetime.datetime(0)
             self.trade_pnls.append((dt, float(trade.pnlcomm)))
@@ -460,7 +610,7 @@ class RightSidePivotStrategy(bt.Strategy):
             self.last_exit_bar = self.bar_count
 
 
-def plot_results(df_plot, strat, initial_cash):
+def plot_results(df_plot, strat, initial_cash, chart_title):
     """
     封装策略回测后的可视化绘图逻辑
     """
@@ -468,7 +618,8 @@ def plot_results(df_plot, strat, initial_cash):
     fig, (ax1, ax2, ax3, ax4, ax5) = plt.subplots(
         5, 1, figsize=(14, 16), sharex=True, gridspec_kw={'height_ratios': [3, 1, 1, 1, 1]}
     )
-    fig.canvas.manager.set_window_title('Backtest Results - Vegas Tunnel')
+    if hasattr(fig.canvas.manager, "set_window_title"):
+        fig.canvas.manager.set_window_title(f'Backtest Results - {chart_title}')
     
     x_dt = df_plot.index
     x_num = mdates.date2num(x_dt.to_pydatetime())
@@ -516,7 +667,7 @@ def plot_results(df_plot, strat, initial_cash):
     if sells_dt and not getattr(strat, 'marker_entry_short', None):
         ax1.scatter(sells_dt, sells_p, marker='v', color='green', s=120, label='Sell', zorder=5)
         
-    ax1.set_title('BTC-USD Trading Strategy', fontsize=14, fontweight='bold')
+    ax1.set_title(chart_title, fontsize=14, fontweight='bold')
     ax1.set_ylabel('Price (USD)', fontsize=12)
     ax1.legend(loc='upper left', fontsize=8, frameon=True, framealpha=0.8, borderpad=0.3, labelspacing=0.3, handlelength=1.5)
     ax1.grid(True, alpha=0.3)
@@ -583,7 +734,7 @@ def plot_results(df_plot, strat, initial_cash):
     ax5.grid(True, alpha=0.3)
 
     # 时间轴格式化
-    locator = mdates.AutoDateLocator(minticks=5, maxticks=8)
+    locator = build_date_locator(x_dt.min(), x_dt.max())
     formatter = mdates.ConciseDateFormatter(locator)
     ax5.xaxis.set_major_locator(locator)
     ax5.xaxis.set_major_formatter(formatter)
@@ -767,12 +918,16 @@ def plot_results(df_plot, strat, initial_cash):
         fig.canvas.draw_idle()
     fig.canvas.mpl_connect('button_press_event', on_click)
     plt.tight_layout()
-    out_dir = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'output')
+    out_dir = get_output_dir()
     os.makedirs(out_dir, exist_ok=True)
     ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
     out_file = os.path.join(out_dir, f"backtest_{x_dt.min().strftime('%Y%m%d')}_{x_dt.max().strftime('%Y%m%d')}_{ts}.png")
     fig.savefig(out_file, dpi=150)
-    plt.show()
+    if is_interactive_backend():
+        plt.show()
+    else:
+        plt.close(fig)
+    return out_file
 
 class CryptoCommissionInfo(bt.CommissionInfo):
     params = (
@@ -797,14 +952,14 @@ def my_strage():
 
     # 替换为新的右侧拐点策略
     cerebro.addstrategy(RightSidePivotStrategy)
-    # 获取当前运行脚本所在目录  
-    modpath = os.path.dirname(os.path.abspath(sys.argv[0]))
+    cerebro.addobserver(MarginUsedObserver)
+    cerebro.addobserver(CashflowObserver)
 
     # 用配置读取CSV数据（切换数据源只改 ACTIVE_DATA_SOURCE）
     data_file = DATA_SOURCES.get(ACTIVE_DATA_SOURCE)
     if not data_file:
         raise ValueError(f"无效的数据源键: {ACTIVE_DATA_SOURCE}，可选: {list(DATA_SOURCES.keys())}")
-    data_path = os.path.join(modpath, "..", DATA_SOURCE_SUBDIR, data_file)
+    data_path = build_data_path(data_file)
     df = pd.read_csv(data_path, parse_dates=['datetime'])
     print(f"当前数据源: {ACTIVE_DATA_SOURCE} -> {data_file}")
     print("数据长度：", len(df))  # df 是你的 DataFrame
@@ -812,13 +967,13 @@ def my_strage():
     df.sort_index(inplace=True)
     start_dt = df.index.min()
     end_dt = df.index.max()
-    df_plot = df.copy()
-    df_plot['ema_fast'] = df_plot['close'].ewm(span=144, adjust=False).mean()
-    df_plot['ema_slow'] = df_plot['close'].ewm(span=169, adjust=False).mean()
+    timeframe, compression = infer_feed_params(df.index)
+    chart_title = build_chart_title(data_file)
+    print(f'图表标题: {chart_title}')
     data = bt.feeds.PandasData(
         dataname=df,
-        timeframe=bt.TimeFrame.Minutes,   # 明确指定为分钟级别
-        compression=60,                   # 1小时K线
+        timeframe=timeframe,
+        compression=compression,
         fromdate=start_dt.to_pydatetime(),
         todate=end_dt.to_pydatetime()
     )
@@ -837,6 +992,9 @@ def my_strage():
     # 引擎运行前打印期出资金  
     initial_cash = cerebro.broker.getvalue()
     print('组合期初资金: %.2f' % initial_cash) 
+    print('单笔风险资金占比: %.0f%%' % (RightSidePivotStrategy.params.risk_percent * 100))
+    print('保证金利用率: %.0f%%' % (RightSidePivotStrategy.params.order_utilization * 100))
+    print(f'推断数据周期: timeframe={timeframe}, compression={compression}')
     results = cerebro.run() 
     strat = results[0]
     # 引擎运行后打期末资金  
@@ -864,8 +1022,19 @@ def my_strage():
         for k, v in sorted(monthly.items(), key=lambda x: x[0]):
             print(f'  {k}: {v*100:.2f}%')
     
-    # 调用绘图函数
-    plot_results(df_plot, strat, initial_cash=initial_cash)
+    # 主要使用 backtrader 自带绘图，叠加策略中的 EMA 与自定义 observers
+    plot_result = cerebro.plot(style='candlestick', volume=False, iplot=False)
+    fig = _extract_first_figure(plot_result)
+    if fig is not None:
+        out_dir = get_output_dir()
+        ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        out_file = os.path.join(out_dir, f"cerebro_plot_{ACTIVE_DATA_SOURCE}_{ts}.png")
+        fig.savefig(out_file, dpi=150, bbox_inches='tight')
+        print(f'Backtrader图表已保存: {out_file}')
+    else:
+        print('cerebro.plot() 已执行，但未提取到可保存的 Figure')
+    if not is_interactive_backend():
+        plt.close('all')
 
 if __name__ == "__main__":
     my_strage()
