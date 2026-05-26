@@ -118,7 +118,7 @@ class RightSidePivotStrategy(bt.Strategy):
     """
     params = (
         ('pivot_period', 8),  # 寻找局部高低点的窗口期（左右各看几根K线）
-        ('risk_percent', 0.10), # 每次开仓使用资金比例 (10%)
+        ('risk_percent', 1.00), # 每次开仓使用资金比例 (100%)
         ('leverage', 10.0),   # 新增：杠杆倍数，默认 10x
         ('order_utilization', 0.95),  # 可用保证金利用率，留少量缓冲避免临界拒单
         ('stop_loss_pct_of_notional', 0.10),  # 单笔名义资金允许亏损比例
