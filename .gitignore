@@ -1,0 +1,5 @@
+examples/config.local
+examples/config
+output/
+*.csv
+examples/okx_paper_state_*.json
